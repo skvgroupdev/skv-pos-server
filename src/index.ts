@@ -48,6 +48,18 @@ app.get("/", (req, res) => {
   res.send("Server is running");
 });
 
+const healthHandler = (req: express.Request, res: express.Response) => {
+  res.status(200).json({
+    status: "ok",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    database:
+      mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  });
+};
+
+app.get("/healthy", healthHandler);
+
 // 5. Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
