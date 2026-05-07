@@ -727,7 +727,12 @@ router.get("/customer-preferences/:customerId", async (req: Request, res: Respon
     try {
         const authReq = req as AuthRequest;
         const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
-        const customerId = new mongoose.Types.ObjectId(req.params.customerId);
+        const customerIdParam = req.params.customerId;
+        if (typeof customerIdParam !== "string" || !mongoose.Types.ObjectId.isValid(customerIdParam)) {
+            return res.status(400).json({ error: "Invalid customer ID" });
+        }
+
+        const customerId = new mongoose.Types.ObjectId(customerIdParam);
 
         // Get customer's purchase history
         const purchaseHistory = await Order.aggregate([

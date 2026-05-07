@@ -232,7 +232,7 @@ export class ProductService {
     await InventoryTransaction.create({
       tenantId: tenantId as any,
       productId: productId as any,
-      type: data.type,
+      type: data.type as any,
       quantity: data.adjustment,
       cost: data.cost || product.costPrice,
       note: data.note || "Manual Adjustment",

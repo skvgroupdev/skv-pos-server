@@ -76,7 +76,7 @@ router.put("/:id", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
     const category = await CategoryService.updateCategory(
       authReq.user!.tenantId,
-      req.params.id,
+      req.params.id as string,
       req.body
     );
     res.json(category);
@@ -88,7 +88,7 @@ router.put("/:id", async (req: Request, res: Response) => {
 router.delete("/:id", async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
-    await CategoryService.deleteCategory(authReq.user!.tenantId, req.params.id);
+    await CategoryService.deleteCategory(authReq.user!.tenantId, req.params.id as string);
     res.json({ message: "Category deleted" });
   } catch (error) {
     res.status(400).json({ error: "Failed to delete category" });

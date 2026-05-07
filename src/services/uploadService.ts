@@ -1,8 +1,6 @@
+import "../config/env";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { v4 as uuidv4 } from 'uuid';
-import dotenv from "dotenv";
-
-dotenv.config();
 
 // Initialize S3 Client
 const s3Client = new S3Client({
@@ -13,11 +11,11 @@ const s3Client = new S3Client({
     },
 });
 
-const BUCKET_NAME = process.env.AWS_BUCKET_NAME || "";
+const BUCKET_NAME = process.env.AWS_BUCKET_NAME || process.env.S3_BUCKET_NAME || "";
 
 export const uploadToS3 = async (file: Express.Multer.File): Promise<string> => {
     if (!BUCKET_NAME) {
-         throw new Error("AWS_BUCKET_NAME is not defined in environment variables");
+         throw new Error("AWS_BUCKET_NAME or S3_BUCKET_NAME is not defined in environment variables");
     }
 
     const fileExtension = file.originalname.split('.').pop();

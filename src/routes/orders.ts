@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express";
 import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
-import Order from "../models/Order";
+import Order, { IOrder } from "../models/Order";
 import Product from "../models/Product";
 import Customer from "../models/Customer";
 import InventoryTransaction from "../models/InventoryTransaction";
@@ -84,7 +84,7 @@ router.post("/", async (req: Request, res: Response) => {
 
         // Calculate Debt Status
         let remainingAmount = 0;
-        let paymentStatus = "PAID";
+        let paymentStatus: IOrder["paymentStatus"] = "PAID";
 
         if (paymentMethod === "DEBT") {
             if (totalPaidInLAK < total) {

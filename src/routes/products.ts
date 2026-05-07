@@ -75,7 +75,7 @@ router.get("/:id", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
     const product = await ProductService.getProductById(
       authReq.user!.tenantId,
-      req.params.id
+      req.params.id as string
     );
     res.json(product);
   } catch (error) {
@@ -101,7 +101,7 @@ router.put("/:id", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
     const product = await ProductService.updateProduct(
       authReq.user!.tenantId,
-      req.params.id,
+      req.params.id as string,
       req.body
     );
     res.json(product);
@@ -113,7 +113,7 @@ router.put("/:id", async (req: Request, res: Response) => {
 router.delete("/:id", async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
-    await ProductService.deleteProduct(authReq.user!.tenantId, req.params.id);
+    await ProductService.deleteProduct(authReq.user!.tenantId, req.params.id as string);
     res.json({ message: "Product deleted" });
   } catch (error) {
     res.status(400).json({ error: "Failed to delete product" });
@@ -125,7 +125,7 @@ router.get("/:id/transactions", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
     const transactions = await ProductService.getProductTransactions(
       authReq.user!.tenantId,
-      req.params.id
+      req.params.id as string
     );
     res.json(transactions);
   } catch (error) {
@@ -158,7 +158,7 @@ router.post("/:id/stock", async (req: Request, res: Response) => {
         
         const product = await ProductService.adjustStock(
             authReq.user!.tenantId,
-            req.params.id,
+            req.params.id as string,
             { adjustment, type, note, cost }
         );
         res.json(product);

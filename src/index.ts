@@ -1,7 +1,7 @@
+import "./config/env";
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
-import dotenv from "dotenv";
 import authRoutes from "./routes/auth";
 import userRoutes from "./routes/users";
 import productRoutes from "./routes/products";
@@ -16,8 +16,6 @@ import debtRoutes from "./routes/debt";
 import reportsRoutes from "./routes/reports";
 import tenantsRoutes from "./routes/tenants";
 import morgan from "morgan";
-// 1. Initialize Dotenv
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -49,7 +47,7 @@ mongoose
 app.get("/", (req, res) => {
   res.send("Server is running");
 });
-console.log(process.env.MONGO_URI)
+
 // 5. Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);

@@ -95,7 +95,6 @@ const OrderSchema: Schema = new Schema(
 );
 
 // Indexes for performance
-OrderSchema.index({ orderId: 1 });
 OrderSchema.index({ tenantId: 1, createdAt: -1 });
 OrderSchema.index({ customerId: 1, paymentStatus: 1 });
 

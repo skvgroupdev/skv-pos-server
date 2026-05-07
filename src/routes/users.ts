@@ -56,7 +56,7 @@ router.put("/:id", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
     const user = await UserService.updateEmployee(
       authReq.user!.tenantId,
-      req.params.id,
+      req.params.id as string,
       req.body
     );
     res.json(user);
@@ -68,7 +68,7 @@ router.put("/:id", async (req: Request, res: Response) => {
 router.delete("/:id", async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
-    await UserService.deleteEmployee(authReq.user!.tenantId, req.params.id, authReq.user!.userId);
+    await UserService.deleteEmployee(authReq.user!.tenantId, req.params.id as string, authReq.user!.userId);
     res.json({ message: "Employee deleted" });
   } catch (error) {
     res.status(400).json({ error: "Failed to delete employee" });
