@@ -20,6 +20,28 @@ npm install
 npm run dev
 ```
 
+## Docker
+
+Run Docker commands from this folder so `docker-compose.yml` can read the local `.env` file:
+
+```bash
+docker compose up --build
+```
+
+Make sure Docker Desktop is running before building or starting the container.
+
+Useful checks:
+
+```bash
+curl http://localhost:${PORT:-8000}/health
+docker compose ps
+docker compose logs -f skv-pos-server
+docker compose down
+```
+
+The Docker image does not copy `.env` into the image. `docker-compose.yml` injects the folder's `.env` at runtime via `env_file`.
+Avoid sharing `docker compose config` output because Docker expands `.env` values in that output.
+
 The server reads `.env` from the project root even when the command is started from a different working directory. Required variables include:
 
 ```bash
