@@ -6,6 +6,16 @@ const router = express.Router();
 
 router.use(authMiddleware as express.RequestHandler);
 
+const sanitizeSvg = (value?: string) => {
+    if (!value || !value.trim().toLowerCase().includes("<svg")) return value || "";
+
+    return value
+        .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
+        .replace(/\son\w+="[^"]*"/gi, "")
+        .replace(/\son\w+='[^']*'/gi, "")
+        .replace(/javascript:/gi, "");
+};
+
 // Get My Tenant Info
 router.get("/me", async (req: Request, res: Response) => {
     try {
@@ -28,10 +38,10 @@ router.put("/me", async (req: Request, res: Response) => {
             authReq.user!.tenantId,
             { 
                 shopName, 
-                logo, 
+                logo: sanitizeSvg(logo),
                 bankName, 
                 bankAccount, 
-                bankQr,
+                bankQr: sanitizeSvg(bankQr),
                 phone,
                 address
             },

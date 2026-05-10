@@ -1,6 +1,7 @@
 import Product, { IProduct } from "../models/Product";
 import InventoryTransaction from "../models/InventoryTransaction";
 import mongoose from "mongoose";
+import { deleteProductImagesFromS3 } from "./uploadService";
 
 export class ProductService {
   static async createProduct(tenantId: string, data: Partial<IProduct>) {
@@ -206,6 +207,23 @@ export class ProductService {
       data,
       { new: true }
     );
+
+    if (product && (data.images !== undefined || data.imageVariants !== undefined)) {
+      const nextImageUrls = new Set<string>();
+      product.images?.forEach((url) => nextImageUrls.add(url));
+      product.imageVariants?.forEach((variant) => {
+        nextImageUrls.add(variant.small);
+        nextImageUrls.add(variant.medium);
+        nextImageUrls.add(variant.original);
+      });
+
+      try {
+        await deleteProductImagesFromS3(oldProduct, nextImageUrls);
+      } catch (error) {
+        console.error("Failed to delete old product images from S3:", error);
+      }
+    }
+
     return product;
   }
 
@@ -215,6 +233,13 @@ export class ProductService {
       tenantId,
     });
     if (!product) throw new Error("Product not found");
+
+    try {
+      await deleteProductImagesFromS3(product);
+    } catch (error) {
+      console.error("Failed to delete product images from S3:", error);
+    }
+
     return product;
   }
 

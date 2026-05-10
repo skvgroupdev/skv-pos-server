@@ -5,6 +5,18 @@ import Product from "../models/Product";
 
 const router = express.Router();
 
+type PopulatedCartItem = {
+    product?: {
+        sellPrice: number;
+        wholesalePrice?: number;
+        costPrice?: number;
+        costCurrency?: string;
+    };
+    price: number;
+    costPrice?: number;
+    costCurrency?: string;
+};
+
 router.use(authMiddleware as express.RequestHandler);
 
 // Get All Carts for User
@@ -126,6 +138,49 @@ router.post("/add", async (req: Request, res: Response) => {
 
     } catch (error: any) {
         res.status(500).json({ error: error.message || "Failed to add to cart" });
+    }
+});
+
+// Sync current cart item prices when sale mode changes.
+router.post("/prices", async (req: Request, res: Response) => {
+    try {
+        const authReq = req as AuthRequest;
+        const { cartId, saleMode } = req.body;
+
+        if (!["retail", "wholesale"].includes(saleMode)) {
+            return res.status(400).json({ error: "Invalid sale mode" });
+        }
+
+        const cart = await Cart.findOne({
+            _id: cartId,
+            tenantId: authReq.user!.tenantId,
+            userId: authReq.user!.userId
+        }).populate("items.product");
+
+        if (!cart) return res.status(404).json({ error: "Cart not found" });
+
+        (cart.items as unknown as PopulatedCartItem[]).forEach((item) => {
+            const product = item.product;
+            if (!product) return;
+
+            const wholesalePrice = product.wholesalePrice || 0;
+            item.price = saleMode === "wholesale" && wholesalePrice > 0
+                ? wholesalePrice
+                : product.sellPrice;
+            item.costPrice = product.costPrice;
+            item.costCurrency = product.costCurrency;
+        });
+
+        await cart.save();
+
+        const carts = await Cart.find({
+            tenantId: authReq.user!.tenantId,
+            userId: authReq.user!.userId
+        }).populate("items.product").populate("customer");
+
+        res.json(carts);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || "Failed to update cart prices" });
     }
 });
 

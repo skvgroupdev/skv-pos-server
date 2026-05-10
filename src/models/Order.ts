@@ -10,6 +10,15 @@ export interface IOrderItem {
 
 export interface IOrder extends Document {
   tenantId: mongoose.Types.ObjectId;
+  tenantSnapshot?: {
+    shopName?: string;
+    logo?: string;
+    address?: string;
+    phone?: string;
+    bankName?: string;
+    bankAccount?: string;
+    bankQr?: string;
+  };
   items: IOrderItem[];
   total: number;
   paymentMethod: "CASH" | "TRANSFER" | "DEBT";
@@ -43,6 +52,15 @@ export interface IOrder extends Document {
 const OrderSchema: Schema = new Schema(
   {
     tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", required: true },
+    tenantSnapshot: {
+      shopName: { type: String },
+      logo: { type: String },
+      address: { type: String },
+      phone: { type: String },
+      bankName: { type: String },
+      bankAccount: { type: String },
+      bankQr: { type: String },
+    },
     items: [
       {
         product: { type: Schema.Types.ObjectId, ref: "Product", required: true },

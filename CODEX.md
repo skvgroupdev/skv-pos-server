@@ -55,6 +55,7 @@ S3_BUCKET_NAME
 ```
 
 `uploadService` accepts either `AWS_BUCKET_NAME` or `S3_BUCKET_NAME` for the S3 bucket name.
+`API_JSON_LIMIT` is optional and defaults to `1mb`; increase only if tenant logo/QR payloads need it.
 
 ## What Was Fixed
 

@@ -43,6 +43,19 @@ router.post("/", async (req: Request, res: Response) => {
         if (!cart) return res.status(404).json({ error: "Cart not found" });
         if (cart.items.length === 0) return res.status(400).json({ error: "Cart is empty" });
 
+        const tenant = await Tenant.findById(authReq.user!.tenantId).select("shopName address phone logo bankName bankAccount bankQr").lean();
+        if (!tenant) return res.status(404).json({ error: "Tenant not found" });
+
+        const tenantSnapshot = {
+            shopName: tenant.shopName || "",
+            address: tenant.address || "",
+            phone: tenant.phone || "",
+            logo: tenant.logo || "",
+            bankName: tenant.bankName || "",
+            bankAccount: tenant.bankAccount || "",
+            bankQr: tenant.bankQr || "",
+        };
+
         const items = cart.items;
 
         // Calculate total from server side
@@ -98,6 +111,7 @@ router.post("/", async (req: Request, res: Response) => {
         // 2. Create Order
         const order = await Order.create({
             tenantId: authReq.user!.tenantId,
+            tenantSnapshot,
             items: items.map((item: any) => ({
                 product: item.product._id,
                 quantity: item.quantity,

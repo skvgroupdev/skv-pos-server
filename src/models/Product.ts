@@ -20,6 +20,11 @@ export interface IProduct extends Document {
   modelName?: string;
   category?: string;
   images?: string[];
+  imageVariants?: {
+    small: string;
+    medium: string;
+    original: string;
+  }[];
   status: "active" | "inactive";
   catalog?: {
     No: string;
@@ -50,6 +55,13 @@ const ProductSchema: Schema = new Schema(
     modelName: { type: String },
     category: { type: String, index: true },
     images: [{ type: String }],
+    imageVariants: [
+      {
+        small: { type: String },
+        medium: { type: String },
+        original: { type: String },
+      },
+    ],
     status: { type: String, enum: ["active", "inactive"], default: "active" },
     catalog: {
       No: { type: String, trim: true },

@@ -19,9 +19,10 @@ import morgan from "morgan";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const jsonLimit = process.env.API_JSON_LIMIT || "1mb";
 
 // 2. Middlewares
-app.use(express.json());
+app.use(express.json({ limit: jsonLimit }));
 app.use(
   cors({
     origin: true,
