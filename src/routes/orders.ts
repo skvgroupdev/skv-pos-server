@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Order, { IOrder } from "../models/Order";
 import Product from "../models/Product";
 import Customer from "../models/Customer";
@@ -21,17 +21,32 @@ const generateShortId = () => {
     return result;
 };
 
+const validPaymentMethods = ["CASH", "TRANSFER", "DEBT"];
+
+const toMoneyAmount = (value: unknown) => {
+    const amount = Number(value);
+    return Number.isFinite(amount) ? amount : NaN;
+};
+
 const router = express.Router();
 
 router.use(authMiddleware as express.RequestHandler);
+router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
 // Create Order (Checkout)
 router.post("/", async (req: Request, res: Response) => {
+    const stockUpdates: { productId: any; quantity: number }[] = [];
+    const createdInventoryTransactionIds: any[] = [];
+    let createdOrderId: any = null;
+
     try {
         const authReq = req as AuthRequest;
         const { cartId, paymentMethod, paidAmount, customerId, discount, payments, exchangeRates } = req.body;
 
         if (!cartId) return res.status(400).json({ error: "Cart ID is required" });
+        if (!validPaymentMethods.includes(paymentMethod)) {
+            return res.status(400).json({ error: "Invalid payment method" });
+        }
 
         // 1. Fetch Cart
         const cart = await Cart.findOne({
@@ -47,9 +62,10 @@ router.post("/", async (req: Request, res: Response) => {
 
         // Calculate total from server side
         let subtotal = items.reduce((sum, item: any) => sum + (item.price * item.quantity), 0);
-        const finalDiscount = Number(discount) || 0;
+        const finalDiscount = toMoneyAmount(discount || 0);
 
         // Validate discount
+        if (!Number.isFinite(finalDiscount)) return res.status(400).json({ error: "Invalid discount" });
         if (finalDiscount < 0) return res.status(400).json({ error: "Discount cannot be negative" });
         if (finalDiscount > subtotal) return res.status(400).json({ error: "Discount cannot exceed order total" });
 
@@ -58,28 +74,57 @@ router.post("/", async (req: Request, res: Response) => {
         // Multi-currency payment calculation
         let totalPaidInLAK = 0;
         const paymentRecords = [];
+        const paidAt = new Date();
 
         if (payments && Array.isArray(payments) && payments.length > 0) {
             for (const p of payments) {
-                const amountInLAK = p.currency === 'LAK' ? p.amount : Math.round(p.amount * p.rate);
+                const amount = toMoneyAmount(p.amount);
+                const rate = p.currency === "LAK" ? 1 : toMoneyAmount(p.rate);
+
+                if (!p.currency || !Number.isFinite(amount) || amount <= 0) {
+                    return res.status(400).json({ error: "Invalid payment amount" });
+                }
+
+                if (!Number.isFinite(rate) || rate <= 0) {
+                    return res.status(400).json({ error: "Invalid payment exchange rate" });
+                }
+
+                const amountInLAK = p.currency === 'LAK' ? amount : Math.round(amount * rate);
                 totalPaidInLAK += amountInLAK;
                 paymentRecords.push({
                     currency: p.currency,
-                    amount: p.amount,
-                    rate: p.rate,
-                    amountInLAK
+                    amount,
+                    rate,
+                    amountInLAK,
+                    paidAt
                 });
             }
         } else {
             // Fallback for single payment (backwards compatibility)
-            const paid = Number(paidAmount) || 0;
+            const paid = toMoneyAmount(paidAmount || 0);
+            if (!Number.isFinite(paid) || paid < 0) {
+                return res.status(400).json({ error: "Invalid paid amount" });
+            }
             totalPaidInLAK = paid;
             paymentRecords.push({
                 currency: 'LAK',
                 amount: paid,
                 rate: 1,
-                amountInLAK: paid
+                amountInLAK: paid,
+                paidAt
             });
+        }
+
+        if (paymentMethod === "DEBT" && !customerId) {
+            return res.status(400).json({ error: "Customer is required for debt payment" });
+        }
+
+        if (paymentMethod === "DEBT" && totalPaidInLAK > total) {
+            return res.status(400).json({ error: "Paid amount cannot exceed debt order total" });
+        }
+
+        if (paymentMethod !== "DEBT" && totalPaidInLAK < total) {
+            return res.status(400).json({ error: "Paid amount is less than order total" });
         }
 
         // Calculate Debt Status
@@ -95,14 +140,52 @@ router.post("/", async (req: Request, res: Response) => {
 
         const orderId = generateShortId();
 
-        // 2. Create Order
+        // 2. Atomically consume the stock reserved by this cart before creating the order.
+        for (const item of items) {
+            const productVal = item.product as any; // Populated
+            const stockResult = await Product.updateOne(
+                {
+                    _id: productVal._id,
+                    tenantId: authReq.user!.tenantId,
+                    stock: { $gte: item.quantity },
+                    reservedStock: { $gte: item.quantity }
+                },
+                {
+                    $inc: {
+                        stock: -item.quantity,
+                        reservedStock: -item.quantity,
+                        soldCount: item.quantity
+                    }
+                }
+            );
+
+            if (stockResult.modifiedCount === 0) {
+                const latestProduct = await Product.findOne({
+                    _id: productVal._id,
+                    tenantId: authReq.user!.tenantId
+                });
+                const available = latestProduct
+                    ? latestProduct.stock - (latestProduct.reservedStock || 0)
+                    : 0;
+
+                const stockError = new Error(
+                    `Stock not available for ${productVal.name}. Available: ${Math.max(0, available)}`
+                ) as Error & { statusCode?: number };
+                stockError.statusCode = 400;
+                throw stockError;
+            }
+
+            stockUpdates.push({ productId: productVal._id, quantity: item.quantity });
+        }
+
+        // 3. Create Order
         const order = await Order.create({
             tenantId: authReq.user!.tenantId,
             items: items.map((item: any) => ({
                 product: item.product._id,
                 quantity: item.quantity,
                 price: item.price,
-                cost: item.costPrice,
+                cost: item.costPrice ?? item.product.costPrice ?? 0,
                 name: item.product.name
             })),
             total,
@@ -119,28 +202,14 @@ router.post("/", async (req: Request, res: Response) => {
             paymentStatus,
             remainingAmount
         });
+        createdOrderId = order._id;
 
-        // 3. Update Stock & Log Transactions & Clear Reservations
+        // 4. Log inventory transactions
         for (const item of items) {
             const productVal = item.product as any; // Populated
 
-            // Release reservation (reduce reservedStock) and Reduce actual stock
-            // We reserved it when adding to cart. Now we permanently remove it.
-            // So: stock = stock - qty; reservedStock = reservedStock - qty;
-
-            await Product.updateOne(
-                { _id: productVal._id },
-                {
-                    $inc: {
-                        stock: -item.quantity,
-                        reservedStock: -item.quantity,
-                        soldCount: item.quantity
-                    }
-                }
-            );
-
             // Log Transaction: OUT_SALE
-            await InventoryTransaction.create({
+            const inventoryTransaction = await InventoryTransaction.create({
                 tenantId: authReq.user!.tenantId,
                 productId: productVal._id,
                 type: "OUT_SALE",
@@ -149,9 +218,10 @@ router.post("/", async (req: Request, res: Response) => {
                 note: `Order #${order._id.toString().slice(-6)}`,
                 date: new Date()
             });
+            createdInventoryTransactionIds.push(inventoryTransaction._id);
         }
 
-        // 4. Update Customer Debt if DEBT payment (or Partial)
+        // 5. Update Customer Debt if DEBT payment (or Partial)
         if (remainingAmount > 0 && customerId) {
             const customer = await Customer.findById(customerId);
             if (customer) {
@@ -178,7 +248,7 @@ router.post("/", async (req: Request, res: Response) => {
             }
         }
 
-        // 5. Delete the Cart (Order is placed)
+        // 6. Delete the Cart (Order is placed)
         await Cart.deleteOne({ _id: cart._id });
 
         // Ensure at least one cart exists for the user (optional, but good UX)
@@ -192,7 +262,7 @@ router.post("/", async (req: Request, res: Response) => {
             });
         }
 
-        // 6. Return populated order for printing
+        // 7. Return populated order for printing
         try {
             const populatedOrder = await Order.findById(order._id)
                 .populate({
@@ -219,7 +289,37 @@ router.post("/", async (req: Request, res: Response) => {
 
     } catch (error) {
         console.error("Order creation failed:", error);
-        res.status(500).json({ error: "Failed to create order" });
+        if (createdOrderId) {
+            await Order.deleteOne({ _id: createdOrderId }).catch((rollbackError) => {
+                console.error("Order rollback failed:", rollbackError);
+            });
+        }
+
+        if (createdInventoryTransactionIds.length > 0) {
+            await InventoryTransaction.deleteMany({
+                _id: { $in: createdInventoryTransactionIds }
+            }).catch((rollbackError) => {
+                console.error("Inventory transaction rollback failed:", rollbackError);
+            });
+        }
+
+        for (const update of stockUpdates.reverse()) {
+            await Product.updateOne(
+                { _id: update.productId },
+                {
+                    $inc: {
+                        stock: update.quantity,
+                        reservedStock: update.quantity,
+                        soldCount: -update.quantity
+                    }
+                }
+            ).catch((rollbackError) => {
+                console.error("Stock rollback failed:", rollbackError);
+            });
+        }
+
+        const statusCode = (error as any)?.statusCode || 500;
+        res.status(statusCode).json({ error: statusCode === 400 ? (error as Error).message : "Failed to create order" });
     }
 });
 

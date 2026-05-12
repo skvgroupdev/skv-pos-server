@@ -1,11 +1,12 @@
 import express, { Request, Response } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Order from "../models/Order";
 import Product from "../models/Product";
 import mongoose from "mongoose";
 
 const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
+router.use(requireRoles(["SHOP_ADMIN"]));
 
 // Helper: Parse Date Range
 const getDateRange = (req: Request) => {

@@ -33,3 +33,22 @@ export const authMiddleware = (
     res.status(401).json({ error: "Authentication token missing" });
   }
 };
+
+export const requireRoles = (allowedRoles: string[]) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const user = (req as AuthRequest).user;
+
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    if (
+      user.roles.includes("SUPER_ADMIN") ||
+      allowedRoles.some((role) => user.roles.includes(role))
+    ) {
+      return next();
+    }
+
+    return res.status(403).json({ error: "Access Denied" });
+  };
+};

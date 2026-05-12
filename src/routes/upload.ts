@@ -1,13 +1,13 @@
 import express from "express";
 import multer from "multer";
 import { uploadToS3 } from "../services/uploadService";
-import { authMiddleware } from "../middleware/authMiddleware";
+import { authMiddleware, requireRoles } from "../middleware/authMiddleware";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // POST /api/upload
-router.post("/", authMiddleware, upload.single("file"), async (req, res) => {
+router.post("/", authMiddleware, requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), upload.single("file"), async (req, res) => {
     try {
         const file = (req as any).file;
         if (!file) {

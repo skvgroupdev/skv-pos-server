@@ -7,6 +7,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "seed:admin": "ts-node src/scripts/init-superadmin.ts",
     "seed:shop": "ts-node src/scripts/init-shop.ts",
+    "seed:skv-store": "ts-node src/scripts/seed-skv-store.ts",
     "seed:employees": "ts-node src/scripts/init-shop-employees.ts",
     "dev": "nodemon --exec ts-node src/index.ts",
     "build": "tsc",

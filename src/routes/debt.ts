@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Customer from "../models/Customer";
 import Order from "../models/Order";
 import DebtTransaction from "../models/DebtTransaction";
@@ -7,6 +7,7 @@ import DebtTransaction from "../models/DebtTransaction";
 const router = express.Router();
 
 router.use(authMiddleware as express.RequestHandler);
+router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
 // Generate unique receipt number
 const generateReceiptNumber = () => {
@@ -37,6 +38,14 @@ router.post("/repay", async (req: Request, res: Response) => {
         if (!customer) return res.status(404).json({ error: "Customer not found" });
 
         const repayAmount = Number(amount);
+        if (!Number.isFinite(repayAmount) || repayAmount <= 0) {
+            return res.status(400).json({ error: "Invalid repayment amount" });
+        }
+
+        if (repayAmount > customer.totalDebt) {
+            return res.status(400).json({ error: `Amount exceeds customer debt (${customer.totalDebt})` });
+        }
+
         let remainingRepay = repayAmount;
         const receiptNumber = generateReceiptNumber();
         const processedBy = authReq.user!.userId;
