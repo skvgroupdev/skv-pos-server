@@ -20,24 +20,14 @@ type PopulatedCartItem = {
 router.use(authMiddleware as express.RequestHandler);
 router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
-const releaseReservedStock = (productId: any, tenantId: any, quantity: number) => {
+const releaseReservedStock = async (productId: any, tenantId: any, quantity: number) => {
     if (quantity <= 0) return Promise.resolve();
 
-    return Product.updateOne(
-        { _id: productId, tenantId },
-        [
-            {
-                $set: {
-                    reservedStock: {
-                        $max: [
-                            0,
-                            { $subtract: [{ $ifNull: ["$reservedStock", 0] }, quantity] }
-                        ]
-                    }
-                }
-            }
-        ] as any
-    );
+    const product = await Product.findOne({ _id: productId, tenantId });
+    if (!product) return;
+
+    product.reservedStock = Math.max(0, (product.reservedStock || 0) - quantity);
+    await product.save();
 };
 
 // Get All Carts for User
@@ -242,6 +232,10 @@ router.post("/remove", async (req: Request, res: Response) => {
         const authReq = req as AuthRequest;
         const { cartId, productId } = req.body;
 
+        if (!cartId || !productId) {
+            return res.status(400).json({ error: "Cart ID and product ID are required" });
+        }
+
         const cart = await Cart.findOne({ 
             _id: cartId,
             tenantId: authReq.user!.tenantId, 
@@ -250,12 +244,17 @@ router.post("/remove", async (req: Request, res: Response) => {
 
         if (!cart) return res.status(404).json({ error: "Cart not found" });
 
-        const itemIndex = cart.items.findIndex(item => item.product.toString() === productId);
+        const itemIndex = cart.items.findIndex((item: any) => {
+            const itemProductId = item.product?._id || item.product;
+            return itemProductId?.toString() === productId;
+        });
+
         if (itemIndex > -1) {
             const item = cart.items[itemIndex];
+            const itemProductId = (item.product as any)?._id || item.product;
             
             // Release Stock
-            await releaseReservedStock(productId, authReq.user!.tenantId, item.quantity);
+            await releaseReservedStock(itemProductId, authReq.user!.tenantId, item.quantity);
 
             cart.items.splice(itemIndex, 1);
             await cart.save();
@@ -264,11 +263,11 @@ router.post("/remove", async (req: Request, res: Response) => {
         const carts = await Cart.find({ 
             tenantId: authReq.user!.tenantId, 
             userId: authReq.user!.userId 
-        }).populate('items.product');
+        }).populate('items.product').populate('customer');
         res.json(carts);
 
-    } catch (error) {
-        res.status(500).json({ error: "Failed to remove item" });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || "Failed to remove item" });
     }
 });
 
