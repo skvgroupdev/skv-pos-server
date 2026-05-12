@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Cart from "../models/Cart";
 import Product from "../models/Product";
 
@@ -18,6 +18,27 @@ type PopulatedCartItem = {
 };
 
 router.use(authMiddleware as express.RequestHandler);
+router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
+
+const releaseReservedStock = (productId: any, tenantId: any, quantity: number) => {
+    if (quantity <= 0) return Promise.resolve();
+
+    return Product.updateOne(
+        { _id: productId, tenantId },
+        [
+            {
+                $set: {
+                    reservedStock: {
+                        $max: [
+                            0,
+                            { $subtract: [{ $ifNull: ["$reservedStock", 0] }, quantity] }
+                        ]
+                    }
+                }
+            }
+        ] as any
+    );
+};
 
 // Get All Carts for User
 router.get("/", async (req: Request, res: Response) => {
@@ -78,29 +99,16 @@ router.post("/add", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { cartId, productId, quantity, price } = req.body;
-        
-        // 1. Check Product Stock and Status
-        const product = await Product.findById(productId);
-        if (!product) return res.status(404).json({ error: "Product not found" });
 
-        if (product.status !== 'active') {
-             return res.status(400).json({ error: "Product is inactive and cannot be sold" });
+        const quantityDelta = Number(quantity);
+        if (!Number.isInteger(quantityDelta) || quantityDelta === 0) {
+            return res.status(400).json({ error: "Invalid quantity" });
         }
 
-        // Skip availability check if removing items (quantity < 0)
-        if (quantity > 0) {
-            const available = product.stock - (product.reservedStock || 0);
-            if (available < quantity) {
-                return res.status(400).json({ error: "Stock not available (Reserved by others)" });
-            }
+        if (quantityDelta > 0 && (!Number.isFinite(Number(price)) || Number(price) < 0)) {
+            return res.status(400).json({ error: "Invalid price" });
         }
 
-        // 2. Reserve Stock
-        // quantity can be negative here, efficiently releasing reservation
-        product.reservedStock = Math.max(0, (product.reservedStock || 0) + quantity);
-        await product.save();
-
-        // 3. Update Cart
         const cart = await Cart.findOne({ 
             _id: cartId,
             tenantId: authReq.user!.tenantId, 
@@ -110,24 +118,68 @@ router.post("/add", async (req: Request, res: Response) => {
         if (!cart) return res.status(404).json({ error: "Cart not found" });
 
         const existingItem = cart.items.find(item => item.product.toString() === productId);
-        if (existingItem) {
-            existingItem.quantity += quantity;
-            if (existingItem.quantity <= 0) {
-                 // Remove item if quantity drops to 0 or less
-                 const idx = cart.items.indexOf(existingItem);
-                 cart.items.splice(idx, 1);
+
+        let reservedQuantity = 0;
+        let product: any = null;
+
+        if (quantityDelta > 0) {
+            const reserveResult = await Product.updateOne(
+                {
+                    _id: productId,
+                    tenantId: authReq.user!.tenantId,
+                    status: "active",
+                    $expr: {
+                        $gte: [
+                            { $subtract: ["$stock", { $ifNull: ["$reservedStock", 0] }] },
+                            quantityDelta
+                        ]
+                    }
+                },
+                { $inc: { reservedStock: quantityDelta } }
+            );
+
+            if (reserveResult.matchedCount === 0) {
+                product = await Product.findOne({ _id: productId, tenantId: authReq.user!.tenantId });
+                if (!product) return res.status(404).json({ error: "Product not found" });
+                if (product.status !== "active") {
+                    return res.status(400).json({ error: "Product is inactive and cannot be sold" });
+                }
+                return res.status(400).json({ error: "Stock not available (Reserved by others)" });
             }
-        } else if (quantity > 0) {
-            cart.items.push({ 
-                product: productId, 
-                quantity, 
-                price,
-                costPrice: product.costPrice,
-                costCurrency: product.costCurrency
-            } as any);
+
+            reservedQuantity = quantityDelta;
+            product = await Product.findById(productId);
         }
-        
-        await cart.save();
+
+        try {
+            if (existingItem) {
+                existingItem.quantity += quantityDelta;
+                if (existingItem.quantity <= 0) {
+                    const releaseQuantity = Math.min(-quantityDelta, existingItem.quantity - quantityDelta);
+                    await releaseReservedStock(productId, authReq.user!.tenantId, releaseQuantity);
+                    const idx = cart.items.indexOf(existingItem);
+                    cart.items.splice(idx, 1);
+                } else if (quantityDelta < 0) {
+                    await releaseReservedStock(productId, authReq.user!.tenantId, -quantityDelta);
+                }
+            } else if (quantityDelta > 0) {
+                cart.items.push({
+                    product: productId,
+                    quantity: quantityDelta,
+                    price: Number(price),
+                    costPrice: product?.costPrice,
+                    costCurrency: product?.costCurrency
+                } as any);
+            } else {
+                await releaseReservedStock(productId, authReq.user!.tenantId, reservedQuantity);
+                return res.status(400).json({ error: "Product is not in cart" });
+            }
+
+            await cart.save();
+        } catch (cartError) {
+            await releaseReservedStock(productId, authReq.user!.tenantId, reservedQuantity);
+            throw cartError;
+        }
         
         const carts = await Cart.find({ 
             tenantId: authReq.user!.tenantId, 
@@ -203,11 +255,7 @@ router.post("/remove", async (req: Request, res: Response) => {
             const item = cart.items[itemIndex];
             
             // Release Stock
-            const product = await Product.findById(productId);
-            if (product) {
-                product.reservedStock = Math.max(0, (product.reservedStock || 0) - item.quantity);
-                await product.save();
-            }
+            await releaseReservedStock(productId, authReq.user!.tenantId, item.quantity);
 
             cart.items.splice(itemIndex, 1);
             await cart.save();
@@ -221,6 +269,47 @@ router.post("/remove", async (req: Request, res: Response) => {
 
     } catch (error) {
         res.status(500).json({ error: "Failed to remove item" });
+    }
+});
+
+// Update cart item prices when switching between retail and wholesale sale modes
+router.post("/prices", async (req: Request, res: Response) => {
+    try {
+        const authReq = req as AuthRequest;
+        const { cartId, saleMode } = req.body;
+
+        if (!["retail", "wholesale"].includes(saleMode)) {
+            return res.status(400).json({ error: "Invalid sale mode" });
+        }
+
+        const cart = await Cart.findOne({
+            _id: cartId,
+            tenantId: authReq.user!.tenantId,
+            userId: authReq.user!.userId
+        }).populate("items.product");
+
+        if (!cart) return res.status(404).json({ error: "Cart not found" });
+
+        for (const item of cart.items as any[]) {
+            const product = item.product;
+            if (!product) continue;
+
+            const wholesalePrice = Number(product.wholesalePrice) || 0;
+            item.price = saleMode === "wholesale" && wholesalePrice > 0
+                ? wholesalePrice
+                : product.sellPrice;
+        }
+
+        await cart.save();
+
+        const carts = await Cart.find({
+            tenantId: authReq.user!.tenantId,
+            userId: authReq.user!.userId
+        }).populate("items.product").populate("customer");
+
+        res.json(carts);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to update cart prices" });
     }
 });
 
@@ -239,11 +328,7 @@ router.delete("/:cartId", async (req: Request, res: Response) => {
         if (cart) {
             // Release all stock
             for (const item of cart.items) {
-                const product = await Product.findById(item.product);
-                if (product) {
-                    product.reservedStock = Math.max(0, (product.reservedStock || 0) - item.quantity);
-                    await product.save();
-                }
+                await releaseReservedStock(item.product, authReq.user!.tenantId, item.quantity);
             }
             
             await Cart.deleteOne({ _id: cartId });

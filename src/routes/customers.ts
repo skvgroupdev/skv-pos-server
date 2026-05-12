@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Customer from "../models/Customer";
 
 import Order from "../models/Order";
@@ -7,6 +7,7 @@ import Order from "../models/Order";
 const router = express.Router();
 
 router.use(authMiddleware as express.RequestHandler);
+router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
 // Get Customer Stats (Total Spend)
 router.get("/:id/stats", async (req: Request, res: Response) => {

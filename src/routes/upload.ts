@@ -1,14 +1,14 @@
 import express from "express";
 import multer from "multer";
 import { uploadProductImageSetToS3, uploadToS3 } from "../services/uploadService";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Tenant from "../models/Tenant";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // POST /api/upload
-router.post("/", authMiddleware, upload.single("file"), async (req, res) => {
+router.post("/", authMiddleware, requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), upload.single("file"), async (req, res) => {
     try {
         const file = (req as any).file;
         if (!file) {

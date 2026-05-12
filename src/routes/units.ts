@@ -1,29 +1,14 @@
-import express, { Request, Response, NextFunction } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import express, { Request, Response } from "express";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import { UnitService } from "../services/UnitService";
 
 const router = express.Router();
 
-// Middleware: Allow ShopAdmin and StockKeeper
-const requireAccess = (req: Request, res: Response, next: NextFunction) => {
-  if (
-    !(req as AuthRequest).user ||
-    (!(req as AuthRequest).user!.roles.includes("SHOP_ADMIN") &&
-      !(req as AuthRequest).user!.roles.includes("CASHIER") &&
-      !(req as AuthRequest).user!.roles.includes("SUPER_ADMIN") &&
-      !(req as AuthRequest).user!.roles.includes("STOCK_KEEPER"))
-  ) {
-    return res.status(403).json({ error: "Access Denied" });
-  }
-  next();
-};
-
 router.use(authMiddleware as express.RequestHandler);
-router.use(requireAccess);
 
 // --- Units ---
 
-router.get("/", async (req: Request, res: Response) => {
+router.get("/", requireRoles(["SHOP_ADMIN", "CASHIER", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     const page = parseInt(req.query.page as string) || 1;
@@ -42,7 +27,7 @@ router.get("/", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/", async (req: Request, res: Response) => {
+router.post("/", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     const unit = await UnitService.createUnit(authReq.user!.tenantId, req.body);
@@ -52,7 +37,7 @@ router.post("/", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/touch", async (req: Request, res: Response) => {
+router.post("/touch", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     const { name } = req.body;
@@ -65,7 +50,7 @@ router.post("/touch", async (req: Request, res: Response) => {
   }
 });
 
-router.put("/:id", async (req: Request, res: Response) => {
+router.put("/:id", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     const unit = await UnitService.updateUnit(
@@ -79,7 +64,7 @@ router.put("/:id", async (req: Request, res: Response) => {
   }
 });
 
-router.delete("/:id", async (req: Request, res: Response) => {
+router.delete("/:id", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     await UnitService.deleteUnit(authReq.user!.tenantId, req.params.id as string);

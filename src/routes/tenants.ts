@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { authMiddleware, AuthRequest } from "../middleware/authMiddleware";
+import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Tenant from "../models/Tenant";
 
 const router = express.Router();
@@ -29,7 +29,7 @@ router.get("/me", async (req: Request, res: Response) => {
 });
 
 // Update Shop Info
-router.put("/me", async (req: Request, res: Response) => {
+router.put("/me", requireRoles(["SHOP_ADMIN"]), async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { shopName, logo, bankName, bankAccount, bankQr, phone, address } = req.body;
