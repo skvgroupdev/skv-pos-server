@@ -15,6 +15,7 @@ import cartRoutes from "./routes/cart";
 import debtRoutes from "./routes/debt";
 import reportsRoutes from "./routes/reports";
 import tenantsRoutes from "./routes/tenants";
+import { startDatabaseBackupScheduler } from "./jobs/backupScheduler";
 import morgan from "morgan";
 
 const app = express();
@@ -41,6 +42,7 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(async () => {
     console.log("Connected to MongoDB");
+    startDatabaseBackupScheduler();
   })
   .catch((err) => console.error("MongoDB connection error:", err));
 
@@ -60,6 +62,7 @@ const healthHandler = (req: express.Request, res: express.Response) => {
 };
 
 app.get("/healthy", healthHandler);
+app.get("/health", healthHandler);
 
 // 5. Routes
 app.use("/api/auth", authRoutes);

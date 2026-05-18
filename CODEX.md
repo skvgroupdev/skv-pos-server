@@ -57,6 +57,39 @@ S3_BUCKET_NAME
 `uploadService` accepts either `AWS_BUCKET_NAME` or `S3_BUCKET_NAME` for the S3 bucket name.
 `API_JSON_LIMIT` is optional and defaults to `1mb`; increase only if tenant logo/QR payloads need it.
 
+## MongoDB Backups To S3
+
+The server can automatically export MongoDB collections as JSON files and upload them to S3 every day at midnight.
+
+Setup:
+
+1. Make sure the AWS credentials can write to the backup bucket.
+2. Add these variables to `.env`:
+
+```bash
+S3_BACKUP_BUCKET_NAME=skvgroupbucket
+S3_BACKUP_PREFIX=backup/pos
+BACKUP_ENABLED=true
+BACKUP_TIMEZONE=Asia/Vientiane
+BACKUP_RETENTION_DAYS=30
+```
+
+Backup behavior:
+
+- Scheduled backup runs inside the backend after MongoDB connects.
+- Schedule: `0 0 * * *` using `BACKUP_TIMEZONE`, defaulting to `Asia/Vientiane`.
+- Each run uploads files under `s3://skvgroupbucket/backup/pos/YYYY-MM-DD/`.
+- Each MongoDB collection is uploaded as a separate pretty-printed JSON file named `<collection>.json`.
+- Collections named `system.*` are skipped.
+- `BACKUP_RETENTION_DAYS=30` deletes backup objects older than 30 days. Set it to `0` to keep all backups.
+- If AWS credentials are missing, the server logs a clear error and continues running without the scheduler.
+
+Manual backup test:
+
+```bash
+npm run backup:run
+```
+
 ## What Was Fixed
 
 - `src/index.ts` now imports `src/config/env.ts` before route imports, so environment variables are available before services initialize.
@@ -64,6 +97,7 @@ S3_BUCKET_NAME
 - Fixed TypeScript errors in `src/routes/orders.ts` around `paymentStatus` and `order._id`.
 - Fixed invalid `customerId` handling in `src/routes/reports.ts`.
 - Fixed S3 bucket env name mismatch in `src/services/uploadService.ts`.
+- Added `/health` as an alias of `/healthy` so Docker healthchecks and docs use a valid endpoint.
 
 ## Verification
 
