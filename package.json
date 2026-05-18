@@ -8,6 +8,7 @@
     "seed:admin": "ts-node src/scripts/init-superadmin.ts",
     "seed:shop": "ts-node src/scripts/init-shop.ts",
     "seed:employees": "ts-node src/scripts/init-shop-employees.ts",
+    "backup:run": "ts-node src/scripts/run-backup.ts",
     "dev": "nodemon --exec ts-node src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js"
@@ -32,6 +33,7 @@
     "mongoose": "^9.0.2",
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
+    "node-cron": "^4.2.1",
     "sharp": "^0.34.5",
     "tailwind-merge": "^3.4.0",
     "uuid": "^13.0.0"
