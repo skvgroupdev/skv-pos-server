@@ -41,7 +41,7 @@ router.post("/", async (req: Request, res: Response) => {
 
     try {
         const authReq = req as AuthRequest;
-        const { cartId, paymentMethod, paidAmount, customerId, discount, payments, exchangeRates } = req.body;
+        const { cartId, paymentMethod, paidAmount, customerId, discount, payments, exchangeRates, saleMode } = req.body;
 
         if (!cartId) return res.status(400).json({ error: "Cart ID is required" });
         if (!validPaymentMethods.includes(paymentMethod)) {
@@ -211,6 +211,7 @@ router.post("/", async (req: Request, res: Response) => {
             change: paymentMethod === 'DEBT' ? 0 : Math.max(0, totalPaidInLAK - total),
             customerId: customerId || null,
             cashierId: authReq.user!.userId,
+            saleMode: saleMode === "wholesale" ? "wholesale" : "retail",
             status: "COMPLETED",
             orderId,
             paymentStatus,

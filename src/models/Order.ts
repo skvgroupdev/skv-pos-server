@@ -45,6 +45,7 @@ export interface IOrder extends Document {
     createdAt: Date;
   }[];
   cashierId: mongoose.Types.ObjectId;
+  saleMode?: "retail" | "wholesale";
   createdAt: Date;
   updatedAt: Date;
 }
@@ -108,6 +109,7 @@ const OrderSchema: Schema = new Schema(
       },
     ],
     cashierId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    saleMode: { type: String, enum: ["retail", "wholesale"], default: "retail" },
   },
   { timestamps: true }
 );

@@ -111,10 +111,48 @@ router.get("/summary", async (req: Request, res: Response) => {
             }
         ];
 
-        const [statsResult, receivedResult, itemsResult] = await Promise.all([
+        // Breakdown by sale mode (retail/wholesale)
+        const saleModePipeline = [
+            { $match: match },
+            { $unwind: "$items" },
+            {
+                $group: {
+                    _id: { orderId: "$_id", saleMode: { $ifNull: ["$saleMode", "retail"] } },
+                    total: { $first: "$total" },
+                    discount: { $first: "$discount" },
+                    totalCost: { $sum: { $multiply: ["$items.cost", "$items.quantity"] } }
+                }
+            },
+            {
+                $group: {
+                    _id: "$_id.saleMode",
+                    totalSales: { $sum: "$total" },
+                    totalOrders: { $count: {} },
+                    totalDiscount: { $sum: "$discount" },
+                    totalCost: { $sum: "$totalCost" }
+                }
+            }
+        ];
+
+        // Hourly breakdown (Vientiane timezone +07:00)
+        const hourlyPipeline = [
+            { $match: match },
+            {
+                $group: {
+                    _id: { $hour: { date: "$createdAt", timezone: "+07:00" } },
+                    orders: { $count: {} },
+                    sales: { $sum: "$total" }
+                }
+            },
+            { $sort: { "_id": 1 } }
+        ];
+
+        const [statsResult, receivedResult, itemsResult, saleModeResult, hourlyResult] = await Promise.all([
             Order.aggregate(statsPipeline),
             Order.aggregate(receivedPipeline),
-            Order.aggregate(itemsPipeline)
+            Order.aggregate(itemsPipeline),
+            Order.aggregate(saleModePipeline as any),
+            Order.aggregate(hourlyPipeline as any)
         ]);
 
         // Process statsResult which is now grouped by paymentMethod
@@ -183,12 +221,30 @@ router.get("/summary", async (req: Request, res: Response) => {
             ...categoryMap[cat]
         })).sort((a, b) => b.profit - a.profit);
 
+        const breakdownBySaleMode = saleModeResult.map((r: any) => ({
+            mode: r._id || "retail",
+            totalSales: r.totalSales,
+            totalOrders: r.totalOrders,
+            totalDiscount: r.totalDiscount,
+            totalCost: r.totalCost,
+            totalProfit: r.totalSales - r.totalCost,
+            avgOrderValue: r.totalOrders > 0 ? r.totalSales / r.totalOrders : 0
+        }));
+
+        const hourlyBreakdown = hourlyResult.map((r: any) => ({
+            hour: r._id,
+            orders: r.orders,
+            sales: r.sales
+        }));
+
         res.json({
             ...stats,
             totalProfit,
             receivedBreakdown,
             profitByCategory,
             breakdownByMethod,
+            breakdownBySaleMode,
+            hourlyBreakdown,
             netSales: stats.totalSales
         });
     } catch (error) {

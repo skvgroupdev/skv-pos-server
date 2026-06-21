@@ -15,6 +15,7 @@ import cartRoutes from "./routes/cart";
 import debtRoutes from "./routes/debt";
 import reportsRoutes from "./routes/reports";
 import tenantsRoutes from "./routes/tenants";
+import quotationRoutes from "./routes/quotations";
 import { startDatabaseBackupScheduler } from "./jobs/backupScheduler";
 import morgan from "morgan";
 
@@ -78,6 +79,7 @@ app.use("/api/cart", cartRoutes);
 app.use("/api/debt", debtRoutes);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/tenants", tenantsRoutes);
+app.use("/api/quotations", quotationRoutes);
 
 // 6. Start Server
 app.listen(PORT, () => {
