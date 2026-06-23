@@ -58,7 +58,7 @@ router.post("/", async (req: Request, res: Response) => {
         if (!cart) return res.status(404).json({ error: "Cart not found" });
         if (cart.items.length === 0) return res.status(400).json({ error: "Cart is empty" });
 
-        const tenant = await Tenant.findById(authReq.user!.tenantId).select("shopName address phone logo bankName bankAccount bankQr").lean();
+        const tenant = await Tenant.findById(authReq.user!.tenantId).select("shopName address phone logo bankName bankAccount bankQr receiptNote").lean();
         if (!tenant) return res.status(404).json({ error: "Tenant not found" });
 
         const tenantSnapshot = {
@@ -69,6 +69,7 @@ router.post("/", async (req: Request, res: Response) => {
             bankName: tenant.bankName || "",
             bankAccount: tenant.bankAccount || "",
             bankQr: tenant.bankQr || "",
+            receiptNote: tenant.receiptNote || "",
         };
 
         const items = cart.items;
@@ -132,8 +133,8 @@ router.post("/", async (req: Request, res: Response) => {
             return res.status(400).json({ error: "Customer is required for debt payment" });
         }
 
-        if (paymentMethod === "DEBT" && totalPaidInLAK > total) {
-            return res.status(400).json({ error: "Paid amount cannot exceed debt order total" });
+        if (paymentMethod === "DEBT" && totalPaidInLAK >= total) {
+            return res.status(400).json({ error: "ຕິດໜີ້ຕ້ອງມີຍອດຄ້າງ — ຖ້າຈ່າຍຄົບໃຫ້ໃຊ້ CASH ຫຼື TRANSFER" });
         }
 
         if (paymentMethod !== "DEBT" && totalPaidInLAK < total) {
@@ -694,6 +695,11 @@ router.post("/:id/cancel", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { id } = req.params;
+        const { cancelReason } = req.body;
+
+        if (!cancelReason || !cancelReason.trim()) {
+            return res.status(400).json({ error: "ກະລຸນາໃສ່ເຫດຜົນການຍົກເລີກ" });
+        }
 
         // 1. Fetch Order
         const order = await Order.findOne({
@@ -757,6 +763,7 @@ router.post("/:id/cancel", async (req: Request, res: Response) => {
 
         // 5. Update Order Status
         order.status = "CANCELLED";
+        order.cancelReason = cancelReason.trim();
         await order.save();
 
         res.json({ message: "Order cancelled successfully", order });

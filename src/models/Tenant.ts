@@ -13,6 +13,7 @@ export interface ITenant extends Document {
   bankName?: string;
   bankAccount?: string;
   bankQr?: string;
+  receiptNote?: string;
 
   status: 'ACTIVE' | 'SUSPENDED' | 'PENDING';
   subscriptionPlan: 'BASIC' | 'PRO' | 'ENTERPRISE';
@@ -36,6 +37,7 @@ const TenantSchema: Schema = new Schema(
     bankName: { type: String },
     bankAccount: { type: String },
     bankQr: { type: String },
+    receiptNote: { type: String },
 
     status: {
       type: String,

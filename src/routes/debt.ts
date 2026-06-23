@@ -185,6 +185,30 @@ router.get("/history/:customerId", async (req: Request, res: Response) => {
     }
 });
 
+// Get Debt Transaction History for a specific Order
+router.get("/order-history/:orderId", async (req: Request, res: Response) => {
+    try {
+        const authReq = req as AuthRequest;
+        const order = await Order.findOne({
+            orderId: req.params.orderId,
+            tenantId: authReq.user!.tenantId
+        }).select("_id");
+
+        if (!order) return res.json([]);
+
+        const transactions = await DebtTransaction.find({
+            order: order._id,
+            tenantId: authReq.user!.tenantId
+        })
+            .sort({ createdAt: 1 })
+            .populate('processedBy', 'username');
+
+        res.json(transactions);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch order debt history" });
+    }
+});
+
 // Get All Debt Transactions (For Shop Owner Analytics)
 router.get("/transactions", async (req: Request, res: Response) => {
     try {

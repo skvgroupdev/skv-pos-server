@@ -18,6 +18,7 @@ export interface IOrder extends Document {
     bankName?: string;
     bankAccount?: string;
     bankQr?: string;
+    receiptNote?: string;
   };
   items: IOrderItem[];
   total: number;
@@ -27,6 +28,7 @@ export interface IOrder extends Document {
   discount: number;
   customerId?: mongoose.Types.ObjectId;
   status: "COMPLETED" | "CANCELLED";
+  cancelReason?: string;
   orderId: string; // 10-digit short ID
   paymentStatus: "PAID" | "PARTIAL" | "UNPAID";
   remainingAmount: number; // For debt tracking
@@ -61,6 +63,7 @@ const OrderSchema: Schema = new Schema(
       bankName: { type: String },
       bankAccount: { type: String },
       bankQr: { type: String },
+      receiptNote: { type: String },
     },
     items: [
       {
@@ -82,6 +85,7 @@ const OrderSchema: Schema = new Schema(
     discount: { type: Number, default: 0 },
     customerId: { type: Schema.Types.ObjectId, ref: "Customer" },
     status: { type: String, enum: ["COMPLETED", "CANCELLED"], default: "COMPLETED" },
+    cancelReason: { type: String },
     orderId: { type: String, required: true, unique: true },
     paymentStatus: { type: String, enum: ["PAID", "PARTIAL", "UNPAID"], default: "PAID" },
     remainingAmount: { type: Number, default: 0 },

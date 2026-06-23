@@ -32,18 +32,19 @@ router.get("/me", async (req: Request, res: Response) => {
 router.put("/me", requireRoles(["SHOP_ADMIN"]), async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
-        const { shopName, logo, bankName, bankAccount, bankQr, phone, address } = req.body;
-        
+        const { shopName, logo, bankName, bankAccount, bankQr, phone, address, receiptNote } = req.body;
+
         const tenant = await Tenant.findByIdAndUpdate(
             authReq.user!.tenantId,
-            { 
-                shopName, 
+            {
+                shopName,
                 logo: sanitizeSvg(logo),
-                bankName, 
-                bankAccount, 
+                bankName,
+                bankAccount,
                 bankQr: sanitizeSvg(bankQr),
                 phone,
-                address
+                address,
+                receiptNote
             },
             { new: true }
         );

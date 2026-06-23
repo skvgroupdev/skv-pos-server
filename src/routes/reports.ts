@@ -2,6 +2,7 @@ import express, { Request, Response } from "express";
 import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMiddleware";
 import Order from "../models/Order";
 import Product from "../models/Product";
+import DebtTransaction from "../models/DebtTransaction";
 import mongoose from "mongoose";
 
 const router = express.Router();
@@ -61,11 +62,32 @@ router.get("/summary", async (req: Request, res: Response) => {
                 $group: {
                     _id: "$paymentMethod",
                     totalSales: { $sum: "$total" },
+                    totalPaid: { $sum: "$paidAmount" }, // actual money received from this order
                     totalOrders: { $count: {} },
                     totalDiscount: { $sum: "$discount" },
                     avgOrderValue: { $avg: "$total" },
                     totalDebt: { $sum: "$remainingAmount" },
                     totalChange: { $sum: "$change" }
+                }
+            }
+        ];
+
+        // Debt repayments received in this period (by repayment date, not order date)
+        const authReqForDebt = req as AuthRequest;
+        const { start: debtStart, end: debtEnd } = getDateRange(req);
+        const debtRepaymentPipeline = [
+            {
+                $match: {
+                    tenantId: new mongoose.Types.ObjectId(authReqForDebt.user!.tenantId),
+                    type: "DEBIT",
+                    createdAt: { $gte: debtStart, $lte: debtEnd }
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    totalRepaid: { $sum: "$amount" },
+                    count: { $sum: 1 }
                 }
             }
         ];
@@ -147,34 +169,49 @@ router.get("/summary", async (req: Request, res: Response) => {
             { $sort: { "_id": 1 } }
         ];
 
-        const [statsResult, receivedResult, itemsResult, saleModeResult, hourlyResult] = await Promise.all([
+        const [statsResult, receivedResult, itemsResult, saleModeResult, hourlyResult, debtRepaymentResult] = await Promise.all([
             Order.aggregate(statsPipeline),
             Order.aggregate(receivedPipeline),
             Order.aggregate(itemsPipeline),
             Order.aggregate(saleModePipeline as any),
-            Order.aggregate(hourlyPipeline as any)
+            Order.aggregate(hourlyPipeline as any),
+            DebtTransaction.aggregate(debtRepaymentPipeline as any)
         ]);
 
         // Process statsResult which is now grouped by paymentMethod
         const breakdownByMethod = statsResult.map(r => ({
             method: r._id,
-            totalSales: r.totalSales, // Sum of order.total (Net Sales already)
+            totalSales: r.totalSales,
+            totalPaid: r.totalPaid,   // actual money received from orders of this method
             totalOrders: r.totalOrders,
             totalDebt: r.totalDebt,
             totalChange: r.totalChange,
             totalDiscount: r.totalDiscount,
-            netRevenue: r.totalSales // Correct: totalSales is already the net revenue
+            netRevenue: r.totalSales
         }));
 
+        const debtRepaymentIncome = debtRepaymentResult[0]?.totalRepaid || 0;
+        const debtRepaymentCount  = debtRepaymentResult[0]?.count || 0;
+
+        // totalSales = all orders' net total (includes DEBT order face value)
+        // actualReceivedFromOrders = only money actually handed over at time of sale
+        // totalIncomeToday = actualReceivedFromOrders + debtRepaymentIncome
         const stats = {
-            totalSales: breakdownByMethod.reduce((sum, b) => sum + b.totalSales, 0),
-            totalOrders: breakdownByMethod.reduce((sum, b) => sum + b.totalOrders, 0),
-            totalDebt: breakdownByMethod.reduce((sum, b) => sum + b.totalDebt, 0),
-            totalChange: breakdownByMethod.reduce((sum, b) => sum + b.totalChange, 0),
+            totalSales:    breakdownByMethod.reduce((sum, b) => sum + b.totalSales, 0),
+            totalOrders:   breakdownByMethod.reduce((sum, b) => sum + b.totalOrders, 0),
+            totalDebt:     breakdownByMethod.reduce((sum, b) => sum + b.totalDebt, 0),
+            totalChange:   breakdownByMethod.reduce((sum, b) => sum + b.totalChange, 0),
             totalDiscount: breakdownByMethod.reduce((sum, b) => sum + b.totalDiscount, 0),
             avgOrderValue: 0
         };
         stats.avgOrderValue = stats.totalSales / (stats.totalOrders || 1);
+
+        // Actual cash/transfer received (excluding unrepaid DEBT)
+        const actualReceivedFromOrders = breakdownByMethod
+            .filter(b => b.method !== "DEBT")
+            .reduce((sum, b) => sum + b.totalPaid, 0)
+            + (breakdownByMethod.find(b => b.method === "DEBT")?.totalPaid || 0); // DEBT down payments
+        const totalIncomeToday = actualReceivedFromOrders + debtRepaymentIncome;
 
         // Adjust received breakdown: subtract change from LAK
         const totalChange = stats.totalChange;
@@ -245,7 +282,12 @@ router.get("/summary", async (req: Request, res: Response) => {
             breakdownByMethod,
             breakdownBySaleMode,
             hourlyBreakdown,
-            netSales: stats.totalSales
+            netSales: stats.totalSales,
+            // ยอดรายรับจริง (ไม่นับ DEBT ที่ยังไม่จ่าย)
+            actualReceivedFromOrders,
+            debtRepaymentIncome,
+            debtRepaymentCount,
+            totalIncomeToday
         });
     } catch (error) {
         console.error("Report Summary Error:", error);
@@ -442,10 +484,35 @@ router.get("/inventory-valuation", async (req: Request, res: Response) => {
             }
         ];
 
-        const [costBreakdown, categoryStats, retailResult] = await Promise.all([
+        // 4b. Projected revenue: wholesalePrice if exists, else sellPrice
+        const projectedRevenuePipeline = [
+            { $match: { tenantId } },
+            {
+                $group: {
+                    _id: null,
+                    projectedRevenue: {
+                        $sum: {
+                            $multiply: [
+                                {
+                                    $cond: [
+                                        { $gt: ["$wholesalePrice", 0] },
+                                        "$wholesalePrice",
+                                        "$sellPrice"
+                                    ]
+                                },
+                                "$stock"
+                            ]
+                        }
+                    }
+                }
+            }
+        ];
+
+        const [costBreakdown, categoryStats, retailResult, projectedResult] = await Promise.all([
             Product.aggregate(costPipeline as any),
             Product.aggregate(categoryPipeline as any),
-            Product.aggregate(retailPipeline as any)
+            Product.aggregate(retailPipeline as any),
+            Product.aggregate(projectedRevenuePipeline as any)
         ]);
 
         const totalRetailValue = retailResult[0]?.totalRetailValue || 0;
@@ -453,12 +520,15 @@ router.get("/inventory-valuation", async (req: Request, res: Response) => {
         // ideally should convert based on exchange rates if multi-currency is used)
         const totalCostValue = costBreakdown.reduce((sum, c) => sum + c.totalCost, 0);
 
+        const projectedRevenue = projectedResult[0]?.projectedRevenue || 0;
+
         res.json({
             totalStock,
             totalItems,
             lowStockCount,
             totalRetailValue,
             totalCostValue,
+            projectedRevenue,
             costBreakdown: costBreakdown.map(c => ({
                 currency: c._id || 'LAK',
                 value: c.totalCost,
@@ -547,7 +617,7 @@ router.get("/product-performance", async (req: Request, res: Response) => {
                     }
                 }
             },
-            { $sort: { totalRevenue: -1 } }
+            { $sort: { totalSold: -1 } }
         ]);
 
         // Calculate ABC Analysis (Pareto principle)
