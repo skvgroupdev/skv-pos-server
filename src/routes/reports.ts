@@ -3,6 +3,8 @@ import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMid
 import Order from "../models/Order";
 import Product from "../models/Product";
 import DebtTransaction from "../models/DebtTransaction";
+import PaymentTransaction from "../models/PaymentTransaction";
+import OrderReturn from "../models/OrderReturn";
 import mongoose from "mongoose";
 
 const router = express.Router();
@@ -33,7 +35,7 @@ const getMatchQuery = (req: Request) => {
     const authReq = req as AuthRequest;
     const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
     const { start, end } = getDateRange(req);
-    const { cashierId } = req.query;
+    const { cashierId, saleMode } = req.query;
 
     const match: any = {
         tenantId,
@@ -44,6 +46,8 @@ const getMatchQuery = (req: Request) => {
     if (cashierId) {
         match.cashierId = new mongoose.Types.ObjectId(cashierId as string);
     }
+    if (saleMode === "retail") match.saleMode = { $in: ["retail", null] };
+    if (saleMode === "wholesale") match.saleMode = "wholesale";
 
     return match;
 };
@@ -54,6 +58,34 @@ router.get("/summary", async (req: Request, res: Response) => {
         const authReq = req as AuthRequest;
         const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
         const match = getMatchQuery(req);
+        const requestedSaleMode = req.query.saleMode === "retail" || req.query.saleMode === "wholesale"
+            ? req.query.saleMode
+            : undefined;
+        const scopedOrderIds = requestedSaleMode
+            ? await Order.find({
+                tenantId,
+                saleMode: requestedSaleMode === "retail" ? { $in: ["retail", null] } : "wholesale",
+            }).distinct("_id")
+            : undefined;
+        const cashflowOrderMatch: any = { ...match };
+        delete cashflowOrderMatch.status;
+        const initialOrderReceiptExpression: any = {
+            $max: [
+                0,
+                {
+                    $subtract: [
+                        {
+                            $cond: [
+                                { $gt: [{ $size: { $ifNull: ["$payments", []] } }, 0] },
+                                { $sum: { $map: { input: "$payments", as: "payment", in: { $ifNull: ["$$payment.amountInLAK", 0] } } } },
+                                { $cond: [{ $eq: ["$paymentMethod", "DEBT"] }, 0, { $ifNull: ["$paidAmount", 0] }] }
+                            ]
+                        },
+                        { $ifNull: ["$change", 0] }
+                    ]
+                }
+            ]
+        };
 
         // Basic Stats (Sales, Orders, Debt)
         const statsPipeline = [
@@ -62,7 +94,7 @@ router.get("/summary", async (req: Request, res: Response) => {
                 $group: {
                     _id: "$paymentMethod",
                     totalSales: { $sum: "$total" },
-                    totalPaid: { $sum: "$paidAmount" }, // actual money received from this order
+                    totalPaid: { $sum: initialOrderReceiptExpression },
                     totalOrders: { $count: {} },
                     totalDiscount: { $sum: "$discount" },
                     avgOrderValue: { $avg: "$total" },
@@ -80,7 +112,8 @@ router.get("/summary", async (req: Request, res: Response) => {
                 $match: {
                     tenantId: new mongoose.Types.ObjectId(authReqForDebt.user!.tenantId),
                     type: "DEBIT",
-                    createdAt: { $gte: debtStart, $lte: debtEnd }
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
                 }
             },
             {
@@ -169,13 +202,167 @@ router.get("/summary", async (req: Request, res: Response) => {
             { $sort: { "_id": 1 } }
         ];
 
-        const [statsResult, receivedResult, itemsResult, saleModeResult, hourlyResult, debtRepaymentResult] = await Promise.all([
+        const cancellationPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    status: "CANCELLED",
+                    ...(scopedOrderIds ? { _id: { $in: scopedOrderIds } } : {}),
+                    $or: [
+                        { cancelledAt: { $gte: debtStart, $lte: debtEnd } },
+                        { cancelledAt: { $exists: false }, updatedAt: { $gte: debtStart, $lte: debtEnd } }
+                    ]
+                }
+            },
+            { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$total" } } }
+        ];
+        const returnPipeline = [
+            { $match: { tenantId, createdAt: { $gte: debtStart, $lte: debtEnd }, ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {}) } },
+            { $unwind: "$items" },
+            {
+                $group: {
+                    _id: null,
+                    returnCount: { $addToSet: "$_id" },
+                    units: { $sum: "$items.quantity" },
+                    value: { $sum: { $multiply: ["$items.price", "$items.quantity"] } },
+                    damagedCost: {
+                        $sum: {
+                            $cond: [
+                                { $in: ["$items.condition", ["DAMAGED", "DEFECTIVE", "INCOMPLETE"]] },
+                                { $multiply: ["$items.cost", "$items.quantity"] },
+                                0
+                            ]
+                        }
+                    }
+                }
+            },
+            { $project: { count: { $size: "$returnCount" }, units: 1, value: 1, damagedCost: 1 } }
+        ];
+        const moneyOutPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    direction: "OUT",
+                    status: "POSTED",
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                }
+            },
+            {
+                $group: {
+                    _id: "$sourceType",
+                    amount: { $sum: "$appliedAmountInLAK" },
+                    count: { $sum: 1 }
+                }
+            }
+        ];
+        const saleIncomePipeline = [
+            {
+                $match: {
+                    tenantId,
+                    sourceType: "SALE",
+                    direction: "IN",
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    amount: { $sum: "$appliedAmountInLAK" },
+                    orderIds: { $addToSet: "$order" }
+                }
+            }
+        ];
+        const legacySaleIncomePipeline = [
+            { $match: cashflowOrderMatch },
+            {
+                $lookup: {
+                    from: "paymenttransactions",
+                    let: { orderId: "$_id", tenantId: "$tenantId" },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ["$order", "$$orderId"] },
+                                        { $eq: ["$tenantId", "$$tenantId"] },
+                                        { $eq: ["$sourceType", "SALE"] }
+                                    ]
+                                }
+                            }
+                        },
+                        { $limit: 1 }
+                    ],
+                    as: "saleLedger"
+                }
+            },
+            { $match: { "saleLedger.0": { $exists: false } } },
+            { $group: { _id: null, amount: { $sum: initialOrderReceiptExpression } } }
+        ];
+        const legacyCancellationPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    status: "CANCELLED",
+                    ...(scopedOrderIds ? { _id: { $in: scopedOrderIds } } : {}),
+                    $or: [
+                        { cancelledAt: { $gte: debtStart, $lte: debtEnd } },
+                        { cancelledAt: { $exists: false }, updatedAt: { $gte: debtStart, $lte: debtEnd } }
+                    ]
+                }
+            },
+            {
+                $lookup: {
+                    from: "paymenttransactions",
+                    let: { orderId: "$_id", tenantId: "$tenantId" },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ["$order", "$$orderId"] },
+                                        { $eq: ["$tenantId", "$$tenantId"] },
+                                        { $eq: ["$sourceType", "REVERSAL"] }
+                                    ]
+                                }
+                            }
+                        },
+                        { $limit: 1 }
+                    ],
+                    as: "reversalLedger"
+                }
+            },
+            { $match: { "reversalLedger.0": { $exists: false } } },
+            { $group: { _id: null, amount: { $sum: initialOrderReceiptExpression }, count: { $sum: 1 } } }
+        ];
+
+        const [
+            statsResult,
+            receivedResult,
+            itemsResult,
+            saleModeResult,
+            hourlyResult,
+            debtRepaymentResult,
+            cancellationResult,
+            returnResult,
+            moneyOutResult,
+            saleIncomeResult,
+            legacySaleIncomeResult,
+            legacyCancellationResult,
+        ] = await Promise.all([
             Order.aggregate(statsPipeline),
             Order.aggregate(receivedPipeline),
             Order.aggregate(itemsPipeline),
             Order.aggregate(saleModePipeline as any),
             Order.aggregate(hourlyPipeline as any),
-            DebtTransaction.aggregate(debtRepaymentPipeline as any)
+            DebtTransaction.aggregate(debtRepaymentPipeline as any),
+            Order.aggregate(cancellationPipeline as any),
+            OrderReturn.aggregate(returnPipeline as any),
+            PaymentTransaction.aggregate(moneyOutPipeline as any),
+            PaymentTransaction.aggregate(saleIncomePipeline as any),
+            Order.aggregate(legacySaleIncomePipeline as any),
+            Order.aggregate(legacyCancellationPipeline as any),
         ]);
 
         // Process statsResult which is now grouped by paymentMethod
@@ -207,11 +394,18 @@ router.get("/summary", async (req: Request, res: Response) => {
         stats.avgOrderValue = stats.totalSales / (stats.totalOrders || 1);
 
         // Actual cash/transfer received (excluding unrepaid DEBT)
-        const actualReceivedFromOrders = breakdownByMethod
-            .filter(b => b.method !== "DEBT")
-            .reduce((sum, b) => sum + b.totalPaid, 0)
-            + (breakdownByMethod.find(b => b.method === "DEBT")?.totalPaid || 0); // DEBT down payments
+        const actualReceivedFromOrders =
+            (saleIncomeResult[0]?.amount || 0) +
+            (legacySaleIncomeResult[0]?.amount || 0);
         const totalIncomeToday = actualReceivedFromOrders + debtRepaymentIncome;
+        const refunds = moneyOutResult
+            .filter((row: any) => row._id === "REFUND")
+            .reduce((sum: number, row: any) => sum + row.amount, 0);
+        const reversalsFromLedger = moneyOutResult
+            .filter((row: any) => row._id === "REVERSAL")
+            .reduce((sum: number, row: any) => sum + row.amount, 0);
+        const reversals = reversalsFromLedger + (legacyCancellationResult[0]?.amount || 0);
+        const moneyOut = refunds + reversals;
 
         // Adjust received breakdown: subtract change from LAK
         const totalChange = stats.totalChange;
@@ -287,7 +481,12 @@ router.get("/summary", async (req: Request, res: Response) => {
             actualReceivedFromOrders,
             debtRepaymentIncome,
             debtRepaymentCount,
-            totalIncomeToday
+            totalIncomeToday,
+            refundAmount: refunds,
+            reversalAmount: reversals,
+            netCashFlow: totalIncomeToday - moneyOut,
+            cancelledOrders: cancellationResult[0] || { count: 0, amount: 0 },
+            returns: returnResult[0] || { count: 0, units: 0, value: 0, damagedCost: 0 }
         });
     } catch (error) {
         console.error("Report Summary Error:", error);
@@ -994,6 +1193,7 @@ router.get("/customer-debt-summary", async (req: Request, res: Response) => {
         const authReq = req as AuthRequest;
         const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
         const { start, end } = getDateRange(req);
+        const saleMode = req.query.saleMode;
 
         const debtSummary = await Order.aggregate([
             {
@@ -1001,7 +1201,8 @@ router.get("/customer-debt-summary", async (req: Request, res: Response) => {
                     tenantId,
                     createdAt: { $gte: start, $lte: end },
                     remainingAmount: { $gt: 0 },
-                    status: { $ne: 'CANCELLED' }
+                    status: { $ne: 'CANCELLED' },
+                    ...(saleMode === "retail" ? { saleMode: { $in: ["retail", null] } } : saleMode === "wholesale" ? { saleMode: "wholesale" } : {})
                 }
             },
             {

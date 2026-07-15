@@ -246,32 +246,39 @@ export class ProductService {
   static async adjustStock(
     tenantId: string,
     productId: string,
-    data: { adjustment: number; type: string; note?: string; cost?: number }
+    data: { adjustment: number; type: string; note: string; cost?: number; processedBy: string }
   ) {
-    const product = await Product.findOne({ _id: productId, tenantId });
-    if (!product) throw new Error("Product not found");
+    const adjustment = Number(data.adjustment);
+    if (!Number.isFinite(adjustment) || adjustment === 0) throw new Error("Invalid stock adjustment");
+    if (data.type === "IN_PURCHASE" && adjustment < 0) throw new Error("Purchase adjustment must increase stock");
+    if (data.type === "OUT_DAMAGE" && adjustment > 0) throw new Error("Damage adjustment must reduce stock");
 
-    const newStock = product.stock + data.adjustment;
+    const session = await mongoose.startSession();
+    try {
+      let updatedProduct: any;
+      await session.withTransaction(async () => {
+        const product = await Product.findOne({ _id: productId, tenantId }).session(session);
+        if (!product) throw new Error("Product not found");
+        if (product.stock + adjustment < 0) throw new Error("Stock cannot be negative");
 
-    // Create Transaction
-    await InventoryTransaction.create({
-      tenantId: tenantId as any,
-      productId: productId as any,
-      type: data.type as any,
-      quantity: data.adjustment,
-      cost: data.cost || product.costPrice,
-      note: data.note || "Manual Adjustment",
-      date: new Date(),
-    });
+        await InventoryTransaction.create([{
+          tenantId: tenantId as any,
+          productId: productId as any,
+          type: data.type as any,
+          quantity: adjustment,
+          cost: data.cost || product.costPrice,
+          note: data.note,
+          processedBy: data.processedBy,
+          date: new Date(),
+        }], { session });
 
-    // Update Product Stock
-    const updatedProduct = await Product.findOneAndUpdate(
-      { _id: productId, tenantId },
-      { stock: newStock },
-      { new: true }
-    );
-
-    return updatedProduct;
+        product.stock += adjustment;
+        updatedProduct = await product.save({ session });
+      });
+      return updatedProduct;
+    } finally {
+      await session.endSession();
+    }
   }
 
   static async getProductTransactions(tenantId: string, productId: string) {

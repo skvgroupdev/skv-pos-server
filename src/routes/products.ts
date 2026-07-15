@@ -9,7 +9,21 @@ router.use(authMiddleware as express.RequestHandler);
 router.get("/", requireRoles(["SHOP_ADMIN", "CASHIER", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
-    const { page, limit, search, category, status, stockLevel, minPrice, maxPrice } = req.query;
+    const {
+      page,
+      limit,
+      search,
+      category,
+      unit,
+      status,
+      stockLevel,
+      minPrice,
+      maxPrice,
+      catalogNo,
+      catalogCode,
+      catalogPage,
+      catalogNumber,
+    } = req.query;
 
     const result = await ProductService.getProducts(
       authReq.user!.tenantId,
@@ -18,11 +32,16 @@ router.get("/", requireRoles(["SHOP_ADMIN", "CASHIER", "STOCK_KEEPER"]), async (
       search as string,
       {
          category: category as string,
+         unit: unit as string,
          status: status as string,
          stockLevel: stockLevel as string,
          minPrice: minPrice ? Number(minPrice) : undefined,
          maxPrice: maxPrice ? Number(maxPrice) : undefined,
-         sort: req.query.sort as string
+         sort: req.query.sort as string,
+         catalogNo: catalogNo as string,
+         catalogCode: catalogCode as string,
+         catalogPage: catalogPage as string,
+         catalogNumber: catalogNumber as string,
       }
     );
     res.json(result);
@@ -80,6 +99,10 @@ router.post("/", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (req: Reque
 router.put("/:id", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
+    const existing = await ProductService.getProductById(authReq.user!.tenantId, req.params.id as string);
+    if (req.body.stock !== undefined && Number(req.body.stock) !== existing.stock) {
+      return res.status(400).json({ error: "Use the audited stock adjustment action to change stock" });
+    }
     const product = await ProductService.updateProduct(
       authReq.user!.tenantId,
       req.params.id as string,
@@ -136,15 +159,19 @@ router.post("/:id/stock", requireRoles(["SHOP_ADMIN", "STOCK_KEEPER"]), async (r
     try {
         const authReq = req as AuthRequest;
         const { adjustment, type, note, cost } = req.body;
+        if (!note?.trim()) return res.status(400).json({ error: "Stock adjustment reason is required" });
+        if (!["IN_PURCHASE", "OUT_DAMAGE", "ADJUST"].includes(type)) {
+          return res.status(400).json({ error: "Invalid manual stock adjustment type" });
+        }
         
         const product = await ProductService.adjustStock(
             authReq.user!.tenantId,
             req.params.id as string,
-            { adjustment, type, note, cost }
+            { adjustment, type, note: note.trim(), cost, processedBy: authReq.user!.userId }
         );
         res.json(product);
     } catch (error) {
-        res.status(500).json({ error: "Failed to adjust stock" });
+        res.status(400).json({ error: (error as Error).message || "Failed to adjust stock" });
     }  
 });
 

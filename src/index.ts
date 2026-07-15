@@ -16,6 +16,8 @@ import debtRoutes from "./routes/debt";
 import reportsRoutes from "./routes/reports";
 import tenantsRoutes from "./routes/tenants";
 import quotationRoutes from "./routes/quotations";
+import financialTransactionRoutes from "./routes/financialTransactions";
+import returnRoutes from "./routes/returns";
 import { startDatabaseBackupScheduler } from "./jobs/backupScheduler";
 import morgan from "morgan";
 
@@ -32,7 +34,6 @@ app.use(
   })
 );
 app.use(morgan("dev"));
-
 // 3. Database Connection
 if (!process.env.MONGO_URI) {
   console.error("Error: MONGO_URI is not defined in .env file");
@@ -80,6 +81,8 @@ app.use("/api/debt", debtRoutes);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/tenants", tenantsRoutes);
 app.use("/api/quotations", quotationRoutes);
+app.use("/api/financial-transactions", financialTransactionRoutes);
+app.use("/api/returns", returnRoutes);
 
 // 6. Start Server
 app.listen(PORT, () => {

@@ -15,6 +15,14 @@ export interface IDebtTransaction extends Document {
   paymentMethod?: "CASH" | "TRANSFER" | "MIXED" | "ADJUSTMENT"; // How debt was repaid
   receiptNumber?: string; // Unique receipt/transaction ID
   reference?: string; // External reference (bank transfer ID, etc.)
+  paymentBreakdown?: Array<{
+    method: "CASH" | "TRANSFER";
+    currency: string;
+    amount: number;
+    rate: number;
+    amountInLAK: number;
+    reference?: string;
+  }>;
   
   createdAt: Date;
   updatedAt: Date;
@@ -36,6 +44,16 @@ const DebtTransactionSchema: Schema = new Schema(
     paymentMethod: { type: String, enum: ["CASH", "TRANSFER", "MIXED", "ADJUSTMENT"] },
     receiptNumber: { type: String },
     reference: { type: String },
+    paymentBreakdown: [
+      {
+        method: { type: String, enum: ["CASH", "TRANSFER"] },
+        currency: { type: String },
+        amount: { type: Number },
+        rate: { type: Number },
+        amountInLAK: { type: Number },
+        reference: { type: String },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -43,6 +61,6 @@ const DebtTransactionSchema: Schema = new Schema(
 // Index for faster queries
 DebtTransactionSchema.index({ customer: 1, createdAt: -1 });
 DebtTransactionSchema.index({ tenantId: 1, type: 1 });
-DebtTransactionSchema.index({ receiptNumber: 1 }, { sparse: true });
+DebtTransactionSchema.index({ tenantId: 1, receiptNumber: 1 }, { unique: true, sparse: true });
 
 export default mongoose.model<IDebtTransaction>("DebtTransaction", DebtTransactionSchema);

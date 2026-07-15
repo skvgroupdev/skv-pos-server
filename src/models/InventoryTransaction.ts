@@ -8,6 +8,7 @@ export interface IInventoryTransaction extends Document {
   cost: number;
   referenceDoc?: string;
   note?: string;
+  processedBy?: mongoose.Types.ObjectId;
   date: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -26,6 +27,7 @@ const InventoryTransactionSchema: Schema = new Schema(
     cost: { type: Number, required: true },
     referenceDoc: { type: String },
     note: { type: String },
+    processedBy: { type: Schema.Types.ObjectId, ref: "User" },
     date: { type: Date, default: Date.now },
   },
   { timestamps: true }

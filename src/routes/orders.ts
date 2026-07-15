@@ -9,6 +9,11 @@ import Cart from "../models/Cart";
 import Tenant from "../models/Tenant"; // Ensure model is registered
 import User from "../models/User"; // Ensure model is registered
 import { randomBytes } from "crypto";
+import PaymentTransaction from "../models/PaymentTransaction";
+import OrderReturn from "../models/OrderReturn";
+import mongoose from "mongoose";
+import { createLedgerEntry, PaymentLineInput } from "../services/PaymentLedgerService";
+import { checkout, CheckoutError } from "../services/CheckoutService";
 
 const generateShortId = () => {
     // 10 chars base32-like (unambiguous chars)
@@ -28,6 +33,54 @@ const toMoneyAmount = (value: unknown) => {
     return Number.isFinite(amount) ? amount : NaN;
 };
 
+const restoreCanceledOrderStock = async (params: {
+    tenantId: string;
+    order: IOrder;
+    processedBy: string;
+    session: mongoose.ClientSession;
+}) => {
+    const itemMap = new Map<string, { productId: mongoose.Types.ObjectId; name: string; quantity: number; cost: number }>();
+    for (const item of params.order.items) {
+        const key = item.product.toString();
+        const existing = itemMap.get(key);
+        if (existing) {
+            existing.quantity += item.quantity;
+            continue;
+        }
+        itemMap.set(key, {
+            productId: item.product,
+            name: item.name,
+            quantity: item.quantity,
+            cost: item.cost,
+        });
+    }
+
+    for (const item of itemMap.values()) {
+        const product = await Product.findOne({
+            _id: item.productId,
+            tenantId: params.tenantId,
+        }).session(params.session);
+        if (!product) {
+            throw Object.assign(new Error(`Product not found for canceled order item ${item.name}`), { statusCode: 404 });
+        }
+
+        product.stock += item.quantity;
+        await product.save({ session: params.session });
+
+        await InventoryTransaction.create([{
+            tenantId: params.tenantId as any,
+            productId: item.productId,
+            type: "VOID_RETURN",
+            quantity: item.quantity,
+            cost: item.cost,
+            referenceDoc: params.order.orderId,
+            note: `Auto restock from canceled bill #${params.order.orderId}`,
+            processedBy: params.processedBy as any,
+            date: new Date(),
+        }], { session: params.session });
+    }
+};
+
 const router = express.Router();
 
 router.use(authMiddleware as express.RequestHandler);
@@ -35,13 +88,47 @@ router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
 // Create Order (Checkout)
 router.post("/", async (req: Request, res: Response) => {
+    try {
+        const authReq = req as AuthRequest;
+        const order = await checkout({
+            tenantId: authReq.user!.tenantId,
+            userId: authReq.user!.userId,
+            cartId: req.body.cartId,
+            paymentMethod: req.body.paymentMethod,
+            paidAmount: req.body.paidAmount,
+            customerId: req.body.customerId,
+            discount: req.body.discount,
+            payments: req.body.payments,
+            exchangeRates: req.body.exchangeRates,
+            saleMode: req.body.saleMode,
+            reference: req.body.reference,
+            idempotencyKey: req.get("Idempotency-Key") || undefined,
+        });
+        return res.status(201).json(order);
+    } catch (error) {
+        console.error("Transactional checkout failed:", error);
+        const statusCode = error instanceof CheckoutError ? error.statusCode : 500;
+        return res.status(statusCode).json({
+            error: statusCode === 500 ? "Failed to create order" : (error as Error).message,
+        });
+    }
+});
+
+router.post("/legacy-checkout-disabled", async (req: Request, res: Response) => {
+    if (req.path === "/legacy-checkout-disabled") {
+        return res.status(410).json({ error: "Legacy checkout is disabled" });
+    }
+    const customerId = req.body.customerId;
     const stockUpdates: { productId: any; quantity: number }[] = [];
     const createdInventoryTransactionIds: any[] = [];
+    const createdDebtTransactionIds: any[] = [];
     let createdOrderId: any = null;
+    let createdPaymentTransactionId: any = null;
+    let customerDebtIncremented = 0;
 
     try {
         const authReq = req as AuthRequest;
-        const { cartId, paymentMethod, paidAmount, customerId, discount, payments, exchangeRates, saleMode } = req.body;
+        const { cartId, paymentMethod, paidAmount, discount, payments, exchangeRates, saleMode } = req.body;
 
         if (!cartId) return res.status(400).json({ error: "Cart ID is required" });
         if (!validPaymentMethods.includes(paymentMethod)) {
@@ -110,7 +197,9 @@ router.post("/", async (req: Request, res: Response) => {
                     amount,
                     rate,
                     amountInLAK,
-                    paidAt
+                    paidAt,
+                    method: p.method,
+                    reference: p.reference
                 });
             }
         } else {
@@ -125,7 +214,9 @@ router.post("/", async (req: Request, res: Response) => {
                 amount: paid,
                 rate: 1,
                 amountInLAK: paid,
-                paidAt
+                paidAt,
+                method: paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
+                reference: req.body.reference
             });
         }
 
@@ -232,17 +323,47 @@ router.post("/", async (req: Request, res: Response) => {
                 quantity: -item.quantity,
                 cost: productVal.costPrice,
                 note: `Order #${order._id.toString().slice(-6)}`,
+                referenceDoc: order.orderId,
+                processedBy: authReq.user!.userId,
                 date: new Date()
             });
             createdInventoryTransactionIds.push(inventoryTransaction._id);
         }
 
+        if (totalPaidInLAK > 0) {
+            const ledger = await createLedgerEntry({
+                tenantId: authReq.user!.tenantId,
+                sourceType: "SALE",
+                direction: "IN",
+                orderId: order._id as any,
+                customerId: order.customerId as any,
+                processedBy: authReq.user!.userId,
+                paymentMethod: paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
+                payments: paymentRecords.map((payment: any) => ({
+                    method: payment.method || (paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH"),
+                    currency: payment.currency,
+                    amount: payment.amount,
+                    rate: payment.rate,
+                    amountInLAK: payment.amountInLAK,
+                    reference: payment.reference,
+                })),
+                appliedAmountInLAK: Math.min(totalPaidInLAK, total),
+                changeInLAK: paymentMethod === "DEBT" ? 0 : Math.max(0, totalPaidInLAK - total),
+                idempotencyKey: req.get("Idempotency-Key") || undefined,
+                sourceRecordKey: `ORDER:${order._id.toString()}`,
+            });
+            createdPaymentTransactionId = ledger._id;
+        }
+
         // 5. Update Customer Debt if DEBT payment (or Partial)
         if (remainingAmount > 0 && customerId) {
-            const customer = await Customer.findById(customerId);
+            const customer = await Customer.findOne({
+                _id: customerId,
+                tenantId: authReq.user!.tenantId,
+            });
             if (customer) {
                 // Create Debt Transaction (Credit)
-                await DebtTransaction.create({
+                const debtTransaction = await DebtTransaction.create({
                     tenantId: authReq.user!.tenantId,
                     customer: customerId,
                     order: order._id,
@@ -252,15 +373,17 @@ router.post("/", async (req: Request, res: Response) => {
                     balanceAfter: customer.totalDebt + remainingAmount,
                     note: `ຕິດໜີ້ #${orderId}`
                 });
+                createdDebtTransactionIds.push(debtTransaction._id);
 
                 // Update Customer Total Debt
                 await Customer.updateOne(
-                    { _id: customerId },
+                    { _id: customerId, tenantId: authReq.user!.tenantId },
                     {
                         $inc: { totalDebt: remainingAmount },
                         $set: { lastPaymentDate: new Date() }
                     }
                 );
+                customerDebtIncremented = remainingAmount;
             }
         }
 
@@ -268,14 +391,18 @@ router.post("/", async (req: Request, res: Response) => {
         await Cart.deleteOne({ _id: cart._id });
 
         // Ensure at least one cart exists for the user (optional, but good UX)
-        const remaining = await Cart.countDocuments({ tenantId: authReq.user!.tenantId, userId: authReq.user!.userId });
-        if (remaining === 0) {
-            await Cart.create({
-                tenantId: authReq.user!.tenantId,
-                userId: authReq.user!.userId,
-                name: "Sale 1",
-                items: []
-            });
+        try {
+            const remaining = await Cart.countDocuments({ tenantId: authReq.user!.tenantId, userId: authReq.user!.userId });
+            if (remaining === 0) {
+                await Cart.create({
+                    tenantId: authReq.user!.tenantId,
+                    userId: authReq.user!.userId,
+                    name: "Sale 1",
+                    items: []
+                });
+            }
+        } catch (cartError) {
+            console.error("Failed to create replacement cart:", cartError);
         }
 
         // 7. Return populated order for printing
@@ -311,6 +438,27 @@ router.post("/", async (req: Request, res: Response) => {
             });
         }
 
+        if (createdPaymentTransactionId) {
+            await PaymentTransaction.deleteOne({ _id: createdPaymentTransactionId }).catch((rollbackError) => {
+                console.error("Payment ledger rollback failed:", rollbackError);
+            });
+        }
+
+        if (createdDebtTransactionIds.length > 0) {
+            await DebtTransaction.deleteMany({ _id: { $in: createdDebtTransactionIds } }).catch((rollbackError) => {
+                console.error("Debt transaction rollback failed:", rollbackError);
+            });
+        }
+
+        if (customerDebtIncremented > 0 && customerId) {
+            await Customer.updateOne(
+                { _id: customerId, tenantId: (req as AuthRequest).user!.tenantId },
+                { $inc: { totalDebt: -customerDebtIncremented } }
+            ).catch((rollbackError) => {
+                console.error("Customer debt rollback failed:", rollbackError);
+            });
+        }
+
         if (createdInventoryTransactionIds.length > 0) {
             await InventoryTransaction.deleteMany({
                 _id: { $in: createdInventoryTransactionIds }
@@ -343,7 +491,7 @@ router.post("/", async (req: Request, res: Response) => {
 router.get("/", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
-        const { customerId, cashierId, paymentMethod, paymentStatus, startDate, endDate, search, page, limit } = req.query;
+        const { customerId, cashierId, paymentMethod, paymentStatus, saleMode, startDate, endDate, search, page, limit } = req.query;
 
         const query: any = { tenantId: authReq.user!.tenantId };
 
@@ -359,6 +507,8 @@ router.get("/", async (req: Request, res: Response) => {
         if (customerId) query.customerId = customerId;
         if (cashierId) query.cashierId = cashierId;
         if (paymentMethod) query.paymentMethod = paymentMethod;
+        if (saleMode === "retail") query.saleMode = { $in: ["retail", null] };
+        if (saleMode === "wholesale") query.saleMode = "wholesale";
         if (paymentStatus) {
             if (paymentStatus === 'UNPAID_ALL') {
                 query.paymentStatus = { $in: ['UNPAID', 'PARTIAL'] };
@@ -387,32 +537,68 @@ router.get("/", async (req: Request, res: Response) => {
         const isPaginationRequested = !!page || !!limit;
 
         if (isPaginationRequested) {
-            const total = await Order.countDocuments(query);
-            const orders = await Order.find(query)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limitNum)
-                .populate({
-                    path: 'tenantId',
-                    select: 'name shopName address phone logo bankName bankAccount bankQr',
-                    model: Tenant
-                })
-                .populate({
-                    path: 'customerId',
-                    select: 'name phone address',
-                    model: Customer
-                })
-                .populate({
-                    path: 'cashierId',
-                    select: 'name username',
-                    model: User
-                });
+            const activeQuery = { ...query, status: { $ne: "CANCELLED" } };
+            const activeAggregateQuery: any = {
+                ...activeQuery,
+                tenantId: new mongoose.Types.ObjectId(authReq.user!.tenantId),
+            };
+            if (customerId) activeAggregateQuery.customerId = new mongoose.Types.ObjectId(String(customerId));
+            if (cashierId) activeAggregateQuery.cashierId = new mongoose.Types.ObjectId(String(cashierId));
+            const initialOrderReceiptExpression: any = {
+                $max: [0, {
+                    $subtract: [
+                        {
+                            $cond: [
+                                { $gt: [{ $size: { $ifNull: ["$payments", []] } }, 0] },
+                                { $sum: { $map: { input: "$payments", as: "payment", in: { $ifNull: ["$$payment.amountInLAK", 0] } } } },
+                                { $cond: [{ $eq: ["$paymentMethod", "DEBT"] }, 0, { $ifNull: ["$paidAmount", 0] }] }
+                            ]
+                        },
+                        { $ifNull: ["$change", 0] }
+                    ]
+                }]
+            };
+            const [total, orders, summaryRows] = await Promise.all([
+                Order.countDocuments(query),
+                Order.find(query)
+                    .sort({ createdAt: -1 })
+                    .skip(skip)
+                    .limit(limitNum)
+                    .populate({
+                        path: 'tenantId',
+                        select: 'name shopName address phone logo bankName bankAccount bankQr',
+                        model: Tenant
+                    })
+                    .populate({
+                        path: 'customerId',
+                        select: 'name phone address',
+                        model: Customer
+                    })
+                    .populate({
+                        path: 'cashierId',
+                        select: 'name username',
+                        model: User
+                    }),
+                Order.aggregate([
+                    { $match: activeAggregateQuery },
+                    {
+                        $group: {
+                            _id: null,
+                            totalSales: { $sum: "$total" },
+                            totalOrders: { $sum: 1 },
+                            totalDebt: { $sum: "$remainingAmount" },
+                            totalPaid: { $sum: initialOrderReceiptExpression }
+                        }
+                    }
+                ])
+            ]);
 
             return res.json({
                 data: orders,
                 total,
                 page: pageNum,
-                totalPages: Math.ceil(total / limitNum)
+                totalPages: Math.ceil(total / limitNum),
+                summary: summaryRows[0] || { totalSales: 0, totalOrders: 0, totalDebt: 0, totalPaid: 0 }
             });
         } else {
             // Legacy return (Array)
@@ -550,7 +736,7 @@ router.get("/dashboard-stats", async (req: Request, res: Response) => {
 
 // Cancel Order
 // Add Payment to Existing Order
-router.post("/:id/add-payment", async (req: Request, res: Response) => {
+router.post("/:id/add-payment-legacy-disabled", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { id } = req.params;
@@ -691,86 +877,129 @@ router.post("/:id/note", async (req: Request, res: Response) => {
     }
 });
 
-router.post("/:id/cancel", async (req: Request, res: Response) => {
+router.post("/:id/cancel", requireRoles(["SHOP_ADMIN"]), async (req: Request, res: Response) => {
+    const authReq = req as AuthRequest;
+    const { id } = req.params;
+    const { cancelReason, cancelReasonCode = "OTHER", refundPaymentMethod = "CASH", restoreStock = false } = req.body;
+
+    if (!cancelReason?.trim()) {
+        return res.status(400).json({ error: "ກະລຸນາໃສ່ເຫດຜົນການຍົກເລີກ" });
+    }
+    if (!["CASH", "TRANSFER", "MIXED"].includes(refundPaymentMethod)) {
+        return res.status(400).json({ error: "Invalid refund payment method" });
+    }
+
+    const session = await mongoose.startSession();
     try {
-        const authReq = req as AuthRequest;
-        const { id } = req.params;
-        const { cancelReason } = req.body;
-
-        if (!cancelReason || !cancelReason.trim()) {
-            return res.status(400).json({ error: "ກະລຸນາໃສ່ເຫດຜົນການຍົກເລີກ" });
-        }
-
-        // 1. Fetch Order
-        const order = await Order.findOne({
-            _id: id,
-            tenantId: authReq.user!.tenantId
-        });
-
-        if (!order) return res.status(404).json({ error: "Order not found" });
-        if (order.status === "CANCELLED") return res.status(400).json({ error: "Order is already cancelled" });
-
-        // 2. Validate Permission (Cashier can only cancel their own, Admins all)
-        // Assuming 'role' is available in user token. If not, we might skipped strict check or query user.
-        // For now, let's allow all authenticated users (since they are staff) to cancel, 
-        // OR better: check if req.user.role !== 'admin' && order.cashierId !== req.user.userId
-        // But the JWT payload might not have role fully populated or standardized yet. 
-        // Let's implement basic ownership check: if not owner and not admin? 
-        // We'll skip complex RBAC for this snippet and trust the frontend filter + backend logging.
-
-        // 3. Restore Stock
-        for (const item of order.items) {
-            await Product.updateOne(
-                { _id: item.product },
-                { $inc: { stock: item.quantity } }
-            );
-
-            // Log Transaction: VOID_RETURN
-            await InventoryTransaction.create({
+        let result: any;
+        await session.withTransaction(async () => {
+            const order = await Order.findOne({
+                _id: id,
                 tenantId: authReq.user!.tenantId,
-                productId: item.product,
-                type: "VOID_RETURN",
-                quantity: item.quantity,
-                cost: item.cost || 0,
-                note: `Void Order #${order.orderId}`,
-                date: new Date()
-            });
-        }
+            }).session(session);
+            if (!order) throw Object.assign(new Error("Order not found"), { statusCode: 404 });
+            if (order.status === "CANCELLED") {
+                throw Object.assign(new Error("Order is already cancelled"), { statusCode: 409 });
+            }
 
-        // 4. Reverse Debt (if applicable)
-        if (order.paymentMethod === 'DEBT' || (order.remainingAmount > 0 && order.customerId)) {
-            const customer = await Customer.findById(order.customerId);
-            if (customer) {
-                // Create Reversal Transaction
-                await DebtTransaction.create({
+            const hasReturns = await OrderReturn.exists({
+                tenantId: authReq.user!.tenantId,
+                order: order._id,
+            }).session(session);
+            if (hasReturns) {
+                throw Object.assign(new Error("An order with item returns cannot be fully cancelled"), { statusCode: 409 });
+            }
+
+            if (restoreStock) {
+                await restoreCanceledOrderStock({
                     tenantId: authReq.user!.tenantId,
-                    customer: order.customerId,
+                    order,
+                    processedBy: authReq.user!.userId,
+                    session,
+                });
+            }
+
+            const appliedPaid = Math.max(0, order.total - order.remainingAmount);
+            let reversal: any;
+            if (appliedPaid > 0) {
+                if (!Array.isArray(req.body.refundPayments) || req.body.refundPayments.length === 0) {
+                    throw Object.assign(new Error(`Refund payment details are required for ${appliedPaid}`), { statusCode: 400 });
+                }
+                const rawPayments: PaymentLineInput[] = req.body.refundPayments;
+                const originalSale = await PaymentTransaction.findOne({
+                    tenantId: authReq.user!.tenantId,
                     order: order._id,
-                    type: "DEBIT", // Reduces Debt
+                    sourceType: "SALE",
+                    status: "POSTED",
+                }).session(session);
+
+                reversal = await createLedgerEntry({
+                    tenantId: authReq.user!.tenantId,
+                    sourceType: "REVERSAL",
+                    direction: "OUT",
+                    orderId: order._id as any,
+                    customerId: order.customerId as any,
+                    processedBy: authReq.user!.userId,
+                    approvedBy: authReq.user!.userId,
+                    paymentMethod: refundPaymentMethod,
+                    payments: rawPayments,
+                    appliedAmountInLAK: appliedPaid,
+                    reasonCode: cancelReasonCode,
+                    note: cancelReason.trim(),
+                    reversalOf: originalSale?._id as any,
+                    idempotencyKey: req.get("Idempotency-Key") || undefined,
+                    sourceRecordKey: `CANCEL:${order._id.toString()}`,
+                    session,
+                });
+                if (originalSale) {
+                    originalSale.status = "REVERSED";
+                    await originalSale.save({ session });
+                }
+            }
+
+            if (order.remainingAmount > 0 && order.customerId) {
+                const customer = await Customer.findOne({
+                    _id: order.customerId,
+                    tenantId: authReq.user!.tenantId,
+                }).session(session);
+                if (!customer) throw Object.assign(new Error("Customer not found"), { statusCode: 404 });
+                const nextDebt = Math.max(0, customer.totalDebt - order.remainingAmount);
+                await DebtTransaction.create([{
+                    tenantId: authReq.user!.tenantId,
+                    customer: customer._id,
+                    order: order._id,
+                    type: "DEBIT",
                     amount: order.remainingAmount,
                     balanceBefore: customer.totalDebt,
-                    balanceAfter: customer.totalDebt - order.remainingAmount,
-                    note: `ຍົກເລີກ #${order.orderId}`
-                });
-
-                // Update Customer Balance
-                await Customer.updateOne(
-                    { _id: order.customerId },
-                    { $inc: { totalDebt: -order.remainingAmount } }
-                );
+                    balanceAfter: nextDebt,
+                    processedBy: authReq.user!.userId,
+                    paymentMethod: "ADJUSTMENT",
+                    note: `ຍົກເລີກ #${order.orderId}: ${cancelReason.trim()}`,
+                }], { session });
+                customer.totalDebt = nextDebt;
+                await customer.save({ session });
             }
-        }
 
-        // 5. Update Order Status
-        order.status = "CANCELLED";
-        order.cancelReason = cancelReason.trim();
-        await order.save();
+            order.status = "CANCELLED";
+            order.cancelReason = cancelReason.trim();
+            order.cancelReasonCode = cancelReasonCode;
+            order.cancelledAt = new Date();
+            order.cancelledBy = new mongoose.Types.ObjectId(authReq.user!.userId);
+            order.remainingAmount = 0;
+            order.paymentStatus = "PAID";
+            await order.save({ session });
 
-        res.json({ message: "Order cancelled successfully", order });
-
+            result = { message: "Order cancelled successfully", order, reversal };
+        });
+        return res.json(result);
     } catch (error) {
         console.error("Cancel order failed:", error);
-        res.status(500).json({ error: "Failed to cancel order" });
+        const statusCode = (error as any)?.statusCode || 500;
+        return res.status(statusCode).json({
+            error: statusCode === 500 ? "Failed to cancel order" : (error as Error).message,
+        });
+    } finally {
+        await session.endSession();
     }
 });
 

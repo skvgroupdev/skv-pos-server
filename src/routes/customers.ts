@@ -83,31 +83,8 @@ router.post("/", async (req: Request, res: Response) => {
   }
 });
 
-// Pay Debt
-router.post("/:id/pay-debt", async (req: Request, res: Response) => {
-    try {
-        const authReq = req as AuthRequest;
-        const { amount } = req.body;
-        
-        if (!amount || amount <= 0) {
-            return res.status(400).json({ error: "Invalid amount" });
-        }
-
-        const customer = await Customer.findOne({ _id: req.params.id, tenantId: authReq.user!.tenantId });
-        if (!customer) {
-            return res.status(404).json({ error: "Customer not found" });
-        }
-
-        customer.totalDebt = Math.max(0, customer.totalDebt - amount);
-        customer.lastPaymentDate = new Date();
-        await customer.save();
-
-        // TODO: Log a DebtTransaction if we had that model, for now just update balance.
-
-        res.json(customer);
-    } catch (error) {
-        res.status(500).json({ error: "Failed to pay debt" });
-    }
+router.post("/:id/pay-debt", (_req: Request, res: Response) => {
+    res.status(410).json({ error: "Use /api/debt/repay so the payment is audited" });
 });
 
 // Update Customer

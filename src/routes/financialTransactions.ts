@@ -1,0 +1,259 @@
+import express, { Request, Response } from "express";
+import { AuthRequest, authMiddleware, requireRoles } from "../middleware/authMiddleware";
+import DebtTransaction from "../models/DebtTransaction";
+import Order from "../models/Order";
+import PaymentTransaction from "../models/PaymentTransaction";
+
+const router = express.Router();
+router.use(authMiddleware as express.RequestHandler);
+router.use(requireRoles(["SHOP_ADMIN"]));
+
+const matchesSearch = (activity: any, search: string) => {
+  const haystack = [
+    activity.transactionId,
+    activity.order?.orderId,
+    activity.customer?.name,
+    activity.customer?.phone,
+    activity.processedBy?.username,
+    activity.note,
+    ...(activity.payments || []).map((line: any) => line.reference),
+  ].filter(Boolean).join(" ").toLowerCase();
+  return haystack.includes(search.toLowerCase());
+};
+
+router.get("/", async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthRequest;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const sourceType = String(req.query.sourceType || "ALL");
+    const paymentMethod = String(req.query.paymentMethod || "ALL");
+    const currency = String(req.query.currency || "ALL");
+    const saleMode = String(req.query.saleMode || "ALL");
+    const cashierId = req.query.cashierId ? String(req.query.cashierId) : "";
+    const search = String(req.query.search || "").trim();
+    const dateFilter: any = {};
+    if (req.query.startDate) dateFilter.$gte = new Date(String(req.query.startDate));
+    if (req.query.endDate) dateFilter.$lte = new Date(String(req.query.endDate));
+
+    const ledgerFilter: any = { tenantId: authReq.user!.tenantId };
+    const scopedSaleModeFilter = saleMode === "retail"
+      ? { $in: ["retail", null] }
+      : saleMode === "wholesale" ? "wholesale" : undefined;
+    const scopedOrderIds = scopedSaleModeFilter
+      ? await Order.find({ tenantId: authReq.user!.tenantId, saleMode: scopedSaleModeFilter }).distinct("_id")
+      : undefined;
+    if (Object.keys(dateFilter).length) ledgerFilter.createdAt = dateFilter;
+    if (sourceType !== "ALL") ledgerFilter.sourceType = sourceType;
+    if (paymentMethod !== "ALL") ledgerFilter.paymentMethod = paymentMethod;
+    if (currency !== "ALL") ledgerFilter["payments.currency"] = currency;
+    if (cashierId) ledgerFilter.processedBy = cashierId;
+    if (scopedOrderIds) ledgerFilter.order = { $in: scopedOrderIds };
+
+    const ledgerRows = await PaymentTransaction.find(ledgerFilter)
+      .sort({ createdAt: -1 })
+      .limit(2000)
+      .populate("order", "orderId total saleMode status cancelReason cancelReasonCode cancelledAt items paidAmount change remainingAmount paymentStatus")
+      .populate("customer", "name phone")
+      .populate("processedBy", "username roles employeeCode")
+      .populate("approvedBy", "username roles")
+      .lean();
+
+    const sourceKeys = new Set(ledgerRows.map((row) => row.sourceRecordKey).filter(Boolean));
+    const legacyRows: any[] = [];
+
+    if (sourceType === "ALL" || sourceType === "SALE") {
+      const orderFilter: any = { tenantId: authReq.user!.tenantId };
+      if (Object.keys(dateFilter).length) orderFilter.createdAt = dateFilter;
+      if (cashierId) orderFilter.cashierId = cashierId;
+      if (paymentMethod !== "ALL") orderFilter.paymentMethod = paymentMethod;
+      if (scopedSaleModeFilter) orderFilter.saleMode = scopedSaleModeFilter;
+      const orders = await Order.find(orderFilter)
+        .sort({ createdAt: -1 })
+        .limit(2000)
+        .populate("customerId", "name phone")
+        .populate("cashierId", "username roles employeeCode")
+        .lean();
+
+      for (const order of orders) {
+        if (sourceKeys.has(`ORDER:${order._id.toString()}`)) continue;
+        const payments = (order.payments || []).map((line: any) => ({
+          method: order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
+          currency: line.currency,
+          amount: line.amount,
+          rate: line.rate,
+          amountInLAK: line.amountInLAK,
+          reference: line.reference,
+        }));
+        if (currency !== "ALL" && !payments.some((line: any) => line.currency === currency)) continue;
+        // `paidAmount` is cumulative and increases again when debt is repaid.  A
+        // legacy SALE row must use only the immutable payment snapshot captured
+        // at checkout, otherwise the later DEBT_REPAYMENT is counted twice.
+        const snapshotGross = payments.reduce((sum: number, line: any) => sum + (Number(line.amountInLAK) || 0), 0);
+        const initialGross = payments.length > 0
+          ? snapshotGross
+          : order.paymentMethod === "DEBT" ? 0 : Number(order.paidAmount || 0);
+        const initialApplied = Math.max(0, initialGross - Number(order.change || 0));
+        legacyRows.push({
+          _id: `legacy-order-${order._id.toString()}`,
+          transactionId: order.orderId,
+          sourceType: "SALE",
+          direction: "IN",
+          order,
+          customer: order.customerId,
+          processedBy: order.cashierId,
+          paymentMethod: order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
+          payments,
+          grossReceivedInLAK: initialGross,
+          appliedAmountInLAK: initialApplied,
+          changeInLAK: order.change || 0,
+          status: order.status === "CANCELLED" ? "REVERSED" : "POSTED",
+          migrationStatus: "INCOMPLETE",
+          createdAt: order.createdAt,
+        });
+      }
+    }
+
+    if (sourceType === "ALL" || sourceType === "DEBT_REPAYMENT") {
+      const debtFilter: any = {
+        tenantId: authReq.user!.tenantId,
+        type: "DEBIT",
+        paymentMethod: { $ne: "ADJUSTMENT" },
+      };
+      if (Object.keys(dateFilter).length) debtFilter.createdAt = dateFilter;
+      if (cashierId) debtFilter.processedBy = cashierId;
+      if (paymentMethod !== "ALL") debtFilter.paymentMethod = paymentMethod;
+      if (scopedOrderIds) debtFilter.order = { $in: scopedOrderIds };
+      const debts = await DebtTransaction.find(debtFilter)
+        .sort({ createdAt: -1 })
+        .limit(2000)
+        .populate("customer", "name phone")
+        .populate("order", "orderId total saleMode status")
+        .populate("processedBy", "username roles employeeCode")
+        .lean();
+
+      for (const debt of debts) {
+        if (sourceKeys.has(`DEBT:${debt._id.toString()}`)) continue;
+        const fallbackMethod = debt.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH";
+        const payments = debt.paymentBreakdown?.length ? debt.paymentBreakdown : [{
+          method: fallbackMethod,
+          currency: "LAK",
+          amount: debt.amount,
+          rate: 1,
+          amountInLAK: debt.amount,
+          reference: debt.reference,
+        }];
+        if (currency !== "ALL" && !payments.some((line: any) => line.currency === currency)) continue;
+        legacyRows.push({
+          _id: `legacy-debt-${debt._id.toString()}`,
+          transactionId: debt.receiptNumber || debt._id.toString(),
+          sourceType: "DEBT_REPAYMENT",
+          direction: "IN",
+          order: debt.order,
+          customer: debt.customer,
+          processedBy: debt.processedBy,
+          paymentMethod: debt.paymentMethod || fallbackMethod,
+          payments,
+          grossReceivedInLAK: debt.amount,
+          appliedAmountInLAK: debt.amount,
+          changeInLAK: 0,
+          note: debt.note,
+          status: "POSTED",
+          migrationStatus: "INCOMPLETE",
+          createdAt: debt.createdAt,
+        });
+      }
+    }
+
+    if (sourceType === "ALL" || sourceType === "REVERSAL") {
+      const cancellationFilter: any = {
+        tenantId: authReq.user!.tenantId,
+        status: "CANCELLED",
+      };
+      if (scopedSaleModeFilter) cancellationFilter.saleMode = scopedSaleModeFilter;
+      if (Object.keys(dateFilter).length) {
+        cancellationFilter.$or = [
+          { cancelledAt: dateFilter },
+          { cancelledAt: { $exists: false }, updatedAt: dateFilter },
+        ];
+      }
+      const cancelledOrders = await Order.find(cancellationFilter)
+        .sort({ cancelledAt: -1 })
+        .limit(2000)
+        .populate("customerId", "name phone")
+        .populate("cashierId", "username roles employeeCode")
+        .populate("cancelledBy", "username roles employeeCode")
+        .lean();
+
+      for (const order of cancelledOrders) {
+        if (sourceKeys.has(`CANCEL:${order._id.toString()}`)) continue;
+        const payments = (order.payments || []).map((line: any) => ({
+          method: line.method || (order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH"),
+          currency: line.currency,
+          amount: line.amount,
+          rate: line.rate,
+          amountInLAK: line.amountInLAK,
+          reference: line.reference,
+        }));
+        const snapshotGross = payments.reduce((sum: number, line: any) => sum + (Number(line.amountInLAK) || 0), 0);
+        const initialGross = payments.length > 0
+          ? snapshotGross
+          : order.paymentMethod === "DEBT" ? 0 : Number(order.paidAmount || 0);
+        const reversedAmount = Math.max(0, initialGross - Number(order.change || 0));
+        if (reversedAmount <= 0) continue;
+        if (paymentMethod !== "ALL" && paymentMethod !== (order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH")) continue;
+        if (currency !== "ALL" && !payments.some((line: any) => line.currency === currency)) continue;
+        legacyRows.push({
+          _id: `legacy-cancel-${order._id.toString()}`,
+          transactionId: `CANCEL-${order.orderId}`,
+          sourceType: "REVERSAL",
+          direction: "OUT",
+          order,
+          customer: order.customerId,
+          processedBy: order.cancelledBy || order.cashierId,
+          paymentMethod: order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
+          payments,
+          grossReceivedInLAK: initialGross,
+          appliedAmountInLAK: reversedAmount,
+          changeInLAK: 0,
+          note: order.cancelReason,
+          reasonCode: order.cancelReasonCode,
+          status: "POSTED",
+          migrationStatus: "INCOMPLETE",
+          createdAt: order.cancelledAt || order.updatedAt,
+        });
+      }
+    }
+
+    let activities = [...ledgerRows, ...legacyRows].sort(
+      (a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    if (search) activities = activities.filter((activity) => matchesSearch(activity, search));
+
+    const summary = activities.reduce(
+      (acc, row: any) => {
+        if (row.direction === "OUT") acc.moneyOut += row.appliedAmountInLAK || 0;
+        else acc.moneyIn += row.appliedAmountInLAK || 0;
+        acc.change += row.changeInLAK || 0;
+        acc.count += 1;
+        return acc;
+      },
+      { moneyIn: 0, moneyOut: 0, change: 0, count: 0 }
+    );
+    const total = activities.length;
+    const data = activities.slice((page - 1) * limit, page * limit);
+
+    res.json({
+      data,
+      total,
+      page,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      summary: { ...summary, net: summary.moneyIn - summary.moneyOut },
+    });
+  } catch (error) {
+    console.error("Financial transactions failed:", error);
+    res.status(500).json({ error: "Failed to fetch financial transactions" });
+  }
+});
+
+export default router;

@@ -3,11 +3,94 @@ import { authMiddleware, AuthRequest, requireRoles } from "../middleware/authMid
 import Customer from "../models/Customer";
 import Order from "../models/Order";
 import DebtTransaction from "../models/DebtTransaction";
+import mongoose from "mongoose";
+import { createLedgerEntry, normalizePaymentLines, PaymentLineInput } from "../services/PaymentLedgerService";
+import PaymentTransaction from "../models/PaymentTransaction";
 
 const router = express.Router();
 
 router.use(authMiddleware as express.RequestHandler);
 router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
+
+router.get("/customers", async (req: Request, res: Response) => {
+    try {
+        const authReq = req as AuthRequest;
+        const page = Math.max(1, Number(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+        const search = String(req.query.search || "").trim();
+        const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
+        const match: any = { tenantId, totalDebt: { $gt: 0 } };
+        if (search) {
+            match.$or = [
+                { name: { $regex: search, $options: "i" } },
+                { phone: { $regex: search, $options: "i" } },
+            ];
+        }
+
+        const pipeline: any[] = [
+            { $match: match },
+            {
+                $lookup: {
+                    from: "orders",
+                    let: { customerId: "$_id", tenantId: "$tenantId" },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ["$customerId", "$$customerId"] },
+                                        { $eq: ["$tenantId", "$$tenantId"] },
+                                        { $ne: ["$status", "CANCELLED"] },
+                                        { $gt: ["$remainingAmount", 0] },
+                                    ],
+                                },
+                            },
+                        },
+                        { $sort: { createdAt: 1 } },
+                        {
+                            $group: {
+                                _id: null,
+                                unpaidOrders: { $sum: 1 },
+                                oldestDebt: { $first: "$createdAt" },
+                                orderDebt: { $sum: "$remainingAmount" },
+                            },
+                        },
+                    ],
+                    as: "debtStats",
+                },
+            },
+            { $unwind: { path: "$debtStats", preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    unpaidOrders: { $ifNull: ["$debtStats.unpaidOrders", 0] },
+                    oldestDebt: "$debtStats.oldestDebt",
+                    orderDebt: { $ifNull: ["$debtStats.orderDebt", 0] },
+                },
+            },
+            { $project: { debtStats: 0 } },
+            { $sort: { totalDebt: -1, updatedAt: -1 } },
+            {
+                $facet: {
+                    data: [{ $skip: (page - 1) * limit }, { $limit: limit }],
+                    meta: [{ $count: "total" }],
+                    summary: [{ $group: { _id: null, totalDebt: { $sum: "$totalDebt" }, customers: { $sum: 1 } } }],
+                },
+            },
+        ];
+        const result = (await Customer.aggregate(pipeline))[0];
+        const total = result.meta[0]?.total || 0;
+        res.json({
+            data: result.data,
+            total,
+            page,
+            totalPages: Math.max(1, Math.ceil(total / limit)),
+            summary: result.summary[0] || { totalDebt: 0, customers: 0 },
+        });
+    } catch (error) {
+        console.error("Fetch debtors failed:", error);
+        res.status(500).json({ error: "Failed to fetch debtors" });
+    }
+});
 
 // Generate unique receipt number
 const generateReceiptNumber = () => {
@@ -18,149 +101,172 @@ const generateReceiptNumber = () => {
 
 // Repay Debt (Enhanced Professional Version)
 router.post("/repay", async (req: Request, res: Response) => {
+    const authReq = req as AuthRequest;
+    const { customerId, orderId, paymentMethod, reference, note } = req.body;
+
     try {
-        const authReq = req as AuthRequest;
-        const { customerId, amount, orderId, paymentMethod, reference, note } = req.body;
-
-        if (!customerId || !amount || amount <= 0) {
-            return res.status(400).json({ error: "Invalid repayment data" });
+        if (!customerId || !paymentMethod || !["CASH", "TRANSFER", "MIXED"].includes(paymentMethod)) {
+            return res.status(400).json({ error: "Customer and payment method are required" });
         }
 
-        if (!paymentMethod || !["CASH", "TRANSFER", "MIXED"].includes(paymentMethod)) {
-            return res.status(400).json({ error: "Payment method required (CASH, TRANSFER, or MIXED)" });
+        const rawPayments: PaymentLineInput[] = Array.isArray(req.body.payments) && req.body.payments.length > 0
+            ? req.body.payments
+            : [{
+                method: paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
+                currency: "LAK",
+                amount: Number(req.body.amount),
+                rate: 1,
+                reference,
+            }];
+        const defaultMethod = paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH";
+        const paymentLines = normalizePaymentLines(rawPayments, defaultMethod);
+        const repayAmount = paymentLines.reduce((sum, line) => sum + line.amountInLAK, 0);
+
+        if (paymentMethod === "MIXED" && new Set(paymentLines.map((line) => line.method)).size < 2) {
+            return res.status(400).json({ error: "Mixed payment must include cash and transfer amounts" });
         }
 
-        const customer = await Customer.findOne({ 
-            _id: customerId, 
-            tenantId: authReq.user!.tenantId 
-        });
-
-        if (!customer) return res.status(404).json({ error: "Customer not found" });
-
-        const repayAmount = Number(amount);
-        if (!Number.isFinite(repayAmount) || repayAmount <= 0) {
-            return res.status(400).json({ error: "Invalid repayment amount" });
-        }
-
-        if (repayAmount > customer.totalDebt) {
-            return res.status(400).json({ error: `Amount exceeds customer debt (${customer.totalDebt})` });
-        }
-
-        let remainingRepay = repayAmount;
-        const receiptNumber = generateReceiptNumber();
-        const processedBy = authReq.user!.userId;
-
-        // If paying specific order
-        if (orderId) {
-            const order = await Order.findOne({
-                orderId: orderId,
-                customerId: customerId,
-                tenantId: authReq.user!.tenantId
-            });
-
-            if (!order) return res.status(404).json({ error: "Order not found" });
-            if (order.remainingAmount <= 0) return res.status(400).json({ error: "Order is already paid" });
-            
-            if (repayAmount > order.remainingAmount) {
-                return res.status(400).json({ error: `Amount exceeds order debt (${order.remainingAmount})` });
-            }
-
-            // Update Order
-            order.paidAmount += repayAmount;
-            order.remainingAmount -= repayAmount;
-            if (order.remainingAmount <= 0) {
-                order.paymentStatus = "PAID";
-                order.remainingAmount = 0;
-            } else {
-                order.paymentStatus = "PARTIAL";
-            }
-            await order.save();
-
-            // Create Professional Transaction Record
-            await DebtTransaction.create({
+        const requestKey = req.get("Idempotency-Key") || undefined;
+        if (requestKey) {
+            const existing = await PaymentTransaction.findOne({
                 tenantId: authReq.user!.tenantId,
-                customer: customerId,
-                order: order._id,
-                type: "DEBIT",
-                amount: repayAmount,
-                balanceBefore: customer.totalDebt,
-                balanceAfter: customer.totalDebt - repayAmount,
-                processedBy: processedBy,
-                paymentMethod: paymentMethod,
-                receiptNumber: receiptNumber,
-                reference: reference || undefined,
-                note: note || `ຊຳລະບິນ #${order.orderId}`
+                idempotencyKey: requestKey,
             });
+            if (existing) {
+                const currentCustomer = await Customer.findOne({
+                    _id: customerId,
+                    tenantId: authReq.user!.tenantId,
+                }).select("totalDebt");
+                return res.json({
+                    success: true,
+                    duplicate: true,
+                    newDebt: currentCustomer?.totalDebt || 0,
+                    transactionId: existing.transactionId,
+                    processedBy: existing.processedBy,
+                });
+            }
+        }
+        const session = await mongoose.startSession();
+        let responseData: any;
 
-        } else {
-            // General Repayment (FIFO)
-            const unpaidOrders = await Order.find({
-                customerId: customerId,
-                tenantId: authReq.user!.tenantId,
-                paymentStatus: { $in: ["UNPAID", "PARTIAL"] }
-            }).sort({ createdAt: 1 });
+        try {
+            await session.withTransaction(async () => {
+                const customer = await Customer.findOne({
+                    _id: customerId,
+                    tenantId: authReq.user!.tenantId,
+                }).session(session);
+                if (!customer) throw Object.assign(new Error("Customer not found"), { statusCode: 404 });
+                if (repayAmount > customer.totalDebt) {
+                    throw Object.assign(new Error(`Amount exceeds customer debt (${customer.totalDebt})`), { statusCode: 400 });
+                }
 
-            const paidOrders: string[] = [];
+                let remainingRepay = repayAmount;
+                const receiptNumber = generateReceiptNumber();
+                const processedBy = authReq.user!.userId;
+                const paidOrders: string[] = [];
+                let linkedOrder: any;
 
-            for (const order of unpaidOrders) {
-                if (remainingRepay <= 0) break;
+                if (orderId) {
+                    linkedOrder = await Order.findOne({
+                        orderId,
+                        customerId,
+                        tenantId: authReq.user!.tenantId,
+                        status: { $ne: "CANCELLED" },
+                    }).session(session);
+                    if (!linkedOrder) throw Object.assign(new Error("Order not found"), { statusCode: 404 });
+                    if (linkedOrder.remainingAmount <= 0) {
+                        throw Object.assign(new Error("Order is already paid"), { statusCode: 400 });
+                    }
+                    if (repayAmount > linkedOrder.remainingAmount) {
+                        throw Object.assign(new Error(`Amount exceeds order debt (${linkedOrder.remainingAmount})`), { statusCode: 400 });
+                    }
 
-                const deduction = Math.min(remainingRepay, order.remainingAmount);
-                
-                order.paidAmount += deduction;
-                order.remainingAmount -= deduction;
-                remainingRepay -= deduction;
-
-                if (order.remainingAmount <= 0) {
-                    order.paymentStatus = "PAID";
-                    order.remainingAmount = 0;
+                    linkedOrder.paidAmount += repayAmount;
+                    linkedOrder.remainingAmount -= repayAmount;
+                    linkedOrder.paymentStatus = linkedOrder.remainingAmount <= 0 ? "PAID" : "PARTIAL";
+                    if (linkedOrder.remainingAmount <= 0) linkedOrder.remainingAmount = 0;
+                    await linkedOrder.save({ session });
+                    paidOrders.push(linkedOrder.orderId);
                 } else {
-                    order.paymentStatus = "PARTIAL";
+                    const unpaidOrders = await Order.find({
+                        customerId,
+                        tenantId: authReq.user!.tenantId,
+                        status: { $ne: "CANCELLED" },
+                        paymentStatus: { $in: ["UNPAID", "PARTIAL"] },
+                    }).sort({ createdAt: 1 }).session(session);
+
+                    for (const order of unpaidOrders) {
+                        if (remainingRepay <= 0) break;
+                        const deduction = Math.min(remainingRepay, order.remainingAmount);
+                        order.paidAmount += deduction;
+                        order.remainingAmount -= deduction;
+                        remainingRepay -= deduction;
+                        order.paymentStatus = order.remainingAmount <= 0 ? "PAID" : "PARTIAL";
+                        if (order.remainingAmount <= 0) order.remainingAmount = 0;
+                        await order.save({ session });
+                        paidOrders.push(order.orderId);
+                    }
+
+                    if (remainingRepay > 0) {
+                        throw Object.assign(new Error("Repayment could not be allocated to active debt orders"), { statusCode: 409 });
+                    }
                 }
-                await order.save();
-                paidOrders.push(order.orderId);
-            }
-            
-            // Professional Transaction Log
-            await DebtTransaction.create({
-                tenantId: authReq.user!.tenantId,
-                customer: customerId,
-                type: "DEBIT",
-                amount: repayAmount,
-                balanceBefore: customer.totalDebt,
-                balanceAfter: Math.max(0, customer.totalDebt - repayAmount),
-                processedBy: processedBy,
-                paymentMethod: paymentMethod,
-                receiptNumber: receiptNumber,
-                reference: reference || undefined,
-                note: note || (remainingRepay > 0 
-                      ? `ຊຳລະລວມ (ເກີນ: ${remainingRepay.toLocaleString()}₭)` 
-                      : `ຊຳລະລວມ ${paidOrders.length} ບິນ`)
+
+                const debtDocs = await DebtTransaction.create([{
+                    tenantId: authReq.user!.tenantId,
+                    customer: customerId,
+                    order: linkedOrder?._id,
+                    type: "DEBIT",
+                    amount: repayAmount,
+                    balanceBefore: customer.totalDebt,
+                    balanceAfter: customer.totalDebt - repayAmount,
+                    processedBy,
+                    paymentMethod,
+                    paymentBreakdown: paymentLines,
+                    receiptNumber,
+                    reference: reference || paymentLines.find((line) => line.method === "TRANSFER")?.reference,
+                    note: note || (linkedOrder ? `ຊຳລະບິນ #${linkedOrder.orderId}` : `ຊຳລະລວມ ${paidOrders.length} ບິນ`),
+                }], { session });
+
+                const ledger = await createLedgerEntry({
+                    tenantId: authReq.user!.tenantId,
+                    sourceType: "DEBT_REPAYMENT",
+                    direction: "IN",
+                    orderId: linkedOrder?._id,
+                    customerId: customer._id as any,
+                    processedBy,
+                    paymentMethod,
+                    payments: paymentLines,
+                    appliedAmountInLAK: repayAmount,
+                    note,
+                    idempotencyKey: requestKey,
+                    sourceRecordKey: `DEBT:${debtDocs[0]._id.toString()}`,
+                    session,
+                });
+
+                customer.totalDebt -= repayAmount;
+                customer.lastPaymentDate = new Date();
+                await customer.save({ session });
+
+                responseData = {
+                    success: true,
+                    newDebt: customer.totalDebt,
+                    receiptNumber,
+                    transactionId: ledger.transactionId,
+                    processedBy,
+                };
             });
+        } finally {
+            await session.endSession();
         }
 
-        // Update Customer Total Debt
-        const newTotalDebt = Math.max(0, customer.totalDebt - repayAmount);
-        await Customer.updateOne(
-            { _id: customerId },
-            { 
-                $set: { 
-                    totalDebt: newTotalDebt,
-                    lastPaymentDate: new Date()
-                }
-            }
-        );
-
-        res.json({ 
-            success: true, 
-            newDebt: newTotalDebt,
-            receiptNumber: receiptNumber,
-            processedBy: authReq.user!.userId
-        });
-
+        return res.json(responseData);
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: "Repayment failed" });
+        console.error("Repayment failed:", error);
+        const statusCode = (error as any)?.statusCode || 500;
+        return res.status(statusCode).json({
+            error: statusCode === 500 ? "Repayment failed" : (error as Error).message,
+        });
     }
 });
 
@@ -175,7 +281,7 @@ router.get("/history/:customerId", async (req: Request, res: Response) => {
             tenantId: authReq.user!.tenantId
         })
         .sort({ createdAt: -1 })
-        .populate('order', 'orderId total paymentMethod')
+        .populate('order', 'orderId total saleMode paymentMethod')
         .populate('processedBy', 'username role')
         .populate('customer', 'name phone');
 
@@ -214,6 +320,8 @@ router.get("/transactions", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { startDate, endDate, cashierId, paymentMethod } = req.query;
+        const page = Math.max(1, Number(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
 
         const filter: any = { tenantId: authReq.user!.tenantId, type: "DEBIT" };
 
@@ -226,12 +334,16 @@ router.get("/transactions", async (req: Request, res: Response) => {
         if (cashierId) filter.processedBy = cashierId;
         if (paymentMethod) filter.paymentMethod = paymentMethod;
 
-        const transactions = await DebtTransaction.find(filter)
+        const [transactions, transactionCount] = await Promise.all([
+          DebtTransaction.find(filter)
             .sort({ createdAt: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
             .populate('customer', 'name phone')
-            .populate('order', 'orderId total')
-            .populate('processedBy', 'username role')
-            .limit(500);
+            .populate('order', 'orderId total saleMode')
+            .populate('processedBy', 'username roles'),
+          DebtTransaction.countDocuments(filter),
+        ]);
 
         // Analytics
         const total = await DebtTransaction.aggregate([
@@ -278,6 +390,9 @@ router.get("/transactions", async (req: Request, res: Response) => {
 
         res.json({
             transactions,
+            total: transactionCount,
+            page,
+            totalPages: Math.max(1, Math.ceil(transactionCount / limit)),
             analytics: {
                 total: total[0] || { totalAmount: 0, count: 0 },
                 byMethod,
@@ -323,7 +438,7 @@ router.get("/cashier-summary", async (req: Request, res: Response) => {
             .sort({ createdAt: -1 })
             .limit(10)
             .populate('customer', 'name phone')
-            .populate('order', 'orderId');
+            .populate('order', 'orderId saleMode');
 
         res.json({
             summary,

@@ -29,6 +29,9 @@ export interface IOrder extends Document {
   customerId?: mongoose.Types.ObjectId;
   status: "COMPLETED" | "CANCELLED";
   cancelReason?: string;
+  cancelReasonCode?: string;
+  cancelledAt?: Date;
+  cancelledBy?: mongoose.Types.ObjectId;
   orderId: string; // 10-digit short ID
   paymentStatus: "PAID" | "PARTIAL" | "UNPAID";
   remainingAmount: number; // For debt tracking
@@ -86,6 +89,9 @@ const OrderSchema: Schema = new Schema(
     customerId: { type: Schema.Types.ObjectId, ref: "Customer" },
     status: { type: String, enum: ["COMPLETED", "CANCELLED"], default: "COMPLETED" },
     cancelReason: { type: String },
+    cancelReasonCode: { type: String },
+    cancelledAt: { type: Date },
+    cancelledBy: { type: Schema.Types.ObjectId, ref: "User" },
     orderId: { type: String, required: true, unique: true },
     paymentStatus: { type: String, enum: ["PAID", "PARTIAL", "UNPAID"], default: "PAID" },
     remainingAmount: { type: Number, default: 0 },
