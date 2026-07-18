@@ -17,13 +17,12 @@ const getDateRange = (req: Request) => {
     const end = endDate ? new Date(endDate as string) : new Date();
     const start = startDate ? new Date(startDate as string) : new Date(end);
 
-    // Set to start/end of day
-    end.setHours(23, 59, 59, 999);
-    // If startDate not provided, maybe default to 30 days ago? Or today?
-    // Let's default 'start' to beginning of 'end' day if only end provided or use explicit logic.
+    // The web app sends explicit ISO boundaries. Keep those timestamps intact so a
+    // Vientiane date does not get shifted again when the API runs in UTC/Docker.
+    if (!endDate) {
+        end.setHours(23, 59, 59, 999);
+    }
     if (!startDate) {
-        start.setHours(0, 0, 0, 0); // Default to today range if nothing provided
-    } else {
         start.setHours(0, 0, 0, 0);
     }
 
@@ -125,7 +124,52 @@ router.get("/summary", async (req: Request, res: Response) => {
             }
         ];
 
-        // Received breakdown by currency
+        // Actual receipts grouped by the way money entered the shop. Unlike an
+        // order's paymentMethod, payment lines correctly classify a deposit on a
+        // DEBT order as CASH/TRANSFER and also include later debt repayments.
+        const receivedByMethodPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    direction: "IN",
+                    status: "POSTED",
+                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                }
+            },
+            {
+                $set: {
+                    appliedRatio: {
+                        $cond: [
+                            { $gt: ["$grossReceivedInLAK", 0] },
+                            { $divide: ["$appliedAmountInLAK", "$grossReceivedInLAK"] },
+                            0
+                        ]
+                    }
+                }
+            },
+            { $unwind: "$payments" },
+            {
+                $group: {
+                    _id: "$payments.method",
+                    totalReceived: {
+                        $sum: { $multiply: ["$payments.amountInLAK", "$appliedRatio"] }
+                    },
+                    transactionIds: { $addToSet: "$_id" }
+                }
+            },
+            {
+                $project: {
+                    _id: 1,
+                    totalReceived: { $round: ["$totalReceived", 0] },
+                    transactionCount: { $size: "$transactionIds" }
+                }
+            }
+        ];
+
+        // Currency received at checkout. Repayments are merged below so the
+        // currency card follows cash received date rather than original sale date.
         const receivedPipeline = [
             { $match: match },
             { $unwind: "$payments" },
@@ -134,6 +178,35 @@ router.get("/summary", async (req: Request, res: Response) => {
                     _id: "$payments.currency",
                     amount: { $sum: "$payments.amount" },
                     amountInLAK: { $sum: "$payments.amountInLAK" }
+                }
+            }
+        ];
+        const debtReceivedPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    type: "DEBIT",
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                }
+            },
+            {
+                $set: {
+                    normalizedPayments: {
+                        $cond: [
+                            { $gt: [{ $size: { $ifNull: ["$paymentBreakdown", []] } }, 0] },
+                            "$paymentBreakdown",
+                            [{ currency: "LAK", amount: "$amount", amountInLAK: "$amount" }]
+                        ]
+                    }
+                }
+            },
+            { $unwind: "$normalizedPayments" },
+            {
+                $group: {
+                    _id: "$normalizedPayments.currency",
+                    amount: { $sum: "$normalizedPayments.amount" },
+                    amountInLAK: { $sum: "$normalizedPayments.amountInLAK" }
                 }
             }
         ];
@@ -340,6 +413,8 @@ router.get("/summary", async (req: Request, res: Response) => {
         const [
             statsResult,
             receivedResult,
+            debtReceivedResult,
+            receivedByMethodResult,
             itemsResult,
             saleModeResult,
             hourlyResult,
@@ -353,6 +428,8 @@ router.get("/summary", async (req: Request, res: Response) => {
         ] = await Promise.all([
             Order.aggregate(statsPipeline),
             Order.aggregate(receivedPipeline),
+            DebtTransaction.aggregate(debtReceivedPipeline as any),
+            PaymentTransaction.aggregate(receivedByMethodPipeline as any),
             Order.aggregate(itemsPipeline),
             Order.aggregate(saleModePipeline as any),
             Order.aggregate(hourlyPipeline as any),
@@ -375,6 +452,11 @@ router.get("/summary", async (req: Request, res: Response) => {
             totalChange: r.totalChange,
             totalDiscount: r.totalDiscount,
             netRevenue: r.totalSales
+        }));
+        const receivedByMethod = receivedByMethodResult.map((row: any) => ({
+            method: row._id,
+            totalReceived: row.totalReceived,
+            transactionCount: row.transactionCount
         }));
 
         const debtRepaymentIncome = debtRepaymentResult[0]?.totalRepaid || 0;
@@ -409,17 +491,20 @@ router.get("/summary", async (req: Request, res: Response) => {
 
         // Adjust received breakdown: subtract change from LAK
         const totalChange = stats.totalChange;
-        const receivedBreakdown = receivedResult.map(r => {
-            let amount = r.amount;
-            let amountInLAK = r.amountInLAK;
-            if (r._id === 'LAK') {
-                amount -= totalChange;
-                amountInLAK -= totalChange;
-            }
+        const receivedByCurrency = new Map<string, { currency: string; amount: number; amountInLAK: number }>();
+        [...receivedResult, ...debtReceivedResult].forEach((row: any) => {
+            const currency = row._id || "LAK";
+            const current = receivedByCurrency.get(currency) || { currency, amount: 0, amountInLAK: 0 };
+            current.amount += row.amount || 0;
+            current.amountInLAK += row.amountInLAK || 0;
+            receivedByCurrency.set(currency, current);
+        });
+        const receivedBreakdown = Array.from(receivedByCurrency.values()).map((row) => {
+            if (row.currency !== "LAK") return row;
             return {
-                currency: r._id,
-                amount,
-                amountInLAK
+                ...row,
+                amount: row.amount - totalChange,
+                amountInLAK: row.amountInLAK - totalChange
             };
         });
 
@@ -472,6 +557,7 @@ router.get("/summary", async (req: Request, res: Response) => {
             ...stats,
             totalProfit,
             receivedBreakdown,
+            receivedByMethod,
             profitByCategory,
             breakdownByMethod,
             breakdownBySaleMode,

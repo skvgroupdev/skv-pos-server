@@ -8,6 +8,38 @@ const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
 router.use(requireRoles(["SHOP_ADMIN"]));
 
+const orderDetailFields = [
+  "orderId",
+  "total",
+  "discount",
+  "saleMode",
+  "status",
+  "paymentMethod",
+  "paymentStatus",
+  "paidAmount",
+  "change",
+  "remainingAmount",
+  "items",
+  "payments",
+  "exchangeRateSnapshots",
+  "notes",
+  "tenantSnapshot",
+  "customerId",
+  "cashierId",
+  "cancelReason",
+  "cancelReasonCode",
+  "cancelledAt",
+  "cancelledBy",
+  "createdAt",
+  "updatedAt",
+].join(" ");
+
+const orderDetailPopulate = [
+  { path: "customerId", select: "name phone address" },
+  { path: "cashierId", select: "username roles employeeCode phone" },
+  { path: "cancelledBy", select: "username roles employeeCode" },
+];
+
 const matchesSearch = (activity: any, search: string) => {
   const haystack = [
     activity.transactionId,
@@ -53,9 +85,9 @@ router.get("/", async (req: Request, res: Response) => {
     const ledgerRows = await PaymentTransaction.find(ledgerFilter)
       .sort({ createdAt: -1 })
       .limit(2000)
-      .populate("order", "orderId total saleMode status cancelReason cancelReasonCode cancelledAt items paidAmount change remainingAmount paymentStatus")
-      .populate("customer", "name phone")
-      .populate("processedBy", "username roles employeeCode")
+      .populate({ path: "order", select: orderDetailFields, populate: orderDetailPopulate })
+      .populate("customer", "name phone address")
+      .populate("processedBy", "username roles employeeCode phone")
       .populate("approvedBy", "username roles")
       .lean();
 
@@ -71,8 +103,9 @@ router.get("/", async (req: Request, res: Response) => {
       const orders = await Order.find(orderFilter)
         .sort({ createdAt: -1 })
         .limit(2000)
-        .populate("customerId", "name phone")
-        .populate("cashierId", "username roles employeeCode")
+        .populate("customerId", "name phone address")
+        .populate("cashierId", "username roles employeeCode phone")
+        .populate("cancelledBy", "username roles employeeCode")
         .lean();
 
       for (const order of orders) {
@@ -127,9 +160,9 @@ router.get("/", async (req: Request, res: Response) => {
       const debts = await DebtTransaction.find(debtFilter)
         .sort({ createdAt: -1 })
         .limit(2000)
-        .populate("customer", "name phone")
-        .populate("order", "orderId total saleMode status")
-        .populate("processedBy", "username roles employeeCode")
+        .populate("customer", "name phone address")
+        .populate({ path: "order", select: orderDetailFields, populate: orderDetailPopulate })
+        .populate("processedBy", "username roles employeeCode phone")
         .lean();
 
       for (const debt of debts) {
@@ -180,8 +213,8 @@ router.get("/", async (req: Request, res: Response) => {
       const cancelledOrders = await Order.find(cancellationFilter)
         .sort({ cancelledAt: -1 })
         .limit(2000)
-        .populate("customerId", "name phone")
-        .populate("cashierId", "username roles employeeCode")
+        .populate("customerId", "name phone address")
+        .populate("cashierId", "username roles employeeCode phone")
         .populate("cancelledBy", "username roles employeeCode")
         .lean();
 
