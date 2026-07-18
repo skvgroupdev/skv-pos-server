@@ -33,6 +33,11 @@ const toMoneyAmount = (value: unknown) => {
     return Number.isFinite(amount) ? amount : NaN;
 };
 
+const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
+    const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+    return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
+};
+
 const restoreCanceledOrderStock = async (params: {
     tenantId: string;
     order: IOrder;
@@ -492,6 +497,7 @@ router.get("/", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { customerId, cashierId, paymentMethod, paymentStatus, saleMode, startDate, endDate, search, page, limit } = req.query;
+        const scopedCashierId = getScopedCashierId(authReq, cashierId);
 
         const query: any = { tenantId: authReq.user!.tenantId };
 
@@ -505,7 +511,7 @@ router.get("/", async (req: Request, res: Response) => {
         }
 
         if (customerId) query.customerId = customerId;
-        if (cashierId) query.cashierId = cashierId;
+        if (scopedCashierId) query.cashierId = scopedCashierId;
         if (paymentMethod) query.paymentMethod = paymentMethod;
         if (saleMode === "retail") query.saleMode = { $in: ["retail", null] };
         if (saleMode === "wholesale") query.saleMode = "wholesale";
@@ -543,7 +549,7 @@ router.get("/", async (req: Request, res: Response) => {
                 tenantId: new mongoose.Types.ObjectId(authReq.user!.tenantId),
             };
             if (customerId) activeAggregateQuery.customerId = new mongoose.Types.ObjectId(String(customerId));
-            if (cashierId) activeAggregateQuery.cashierId = new mongoose.Types.ObjectId(String(cashierId));
+            if (scopedCashierId) activeAggregateQuery.cashierId = new mongoose.Types.ObjectId(String(scopedCashierId));
             const initialOrderReceiptExpression: any = {
                 $max: [0, {
                     $subtract: [
@@ -820,10 +826,12 @@ router.get("/:id/payments", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { id } = req.params;
+        const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
 
         const order = await Order.findOne({
             _id: id,
-            tenantId: authReq.user!.tenantId
+            tenantId: authReq.user!.tenantId,
+            ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
         }).populate('customerId', 'name phone');
 
         if (!order) return res.status(404).json({ error: "Order not found" });
@@ -849,6 +857,7 @@ router.post("/:id/note", async (req: Request, res: Response) => {
         const authReq = req as AuthRequest;
         const { id } = req.params;
         const { note } = req.body;
+        const scopedCashierId = getScopedCashierId(authReq, req.body.cashierId);
 
         if (!note || note.trim() === '') {
             return res.status(400).json({ error: "Note cannot be empty" });
@@ -856,7 +865,8 @@ router.post("/:id/note", async (req: Request, res: Response) => {
 
         const order = await Order.findOne({
             _id: id,
-            tenantId: authReq.user!.tenantId
+            tenantId: authReq.user!.tenantId,
+            ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
         });
 
         if (!order) return res.status(404).json({ error: "Order not found" });

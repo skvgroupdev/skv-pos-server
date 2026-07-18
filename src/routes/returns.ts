@@ -10,24 +10,36 @@ import { createLedgerEntry, normalizePaymentLines, PaymentLineInput } from "../s
 
 const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
-router.use(requireRoles(["SHOP_ADMIN"]));
+
+const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
+  const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+  return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
+};
 
 const createReturnId = () =>
   `RT${Date.now().toString(36).toUpperCase()}${randomBytes(3).toString("hex").toUpperCase()}`;
 
-router.get("/", async (req: Request, res: Response) => {
+router.get("/", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     const page = Math.max(1, Number(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
     const filter: any = { tenantId: authReq.user!.tenantId };
     if (req.query.orderId) {
       const order = await Order.findOne({
         tenantId: authReq.user!.tenantId,
         orderId: req.query.orderId,
+        ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
       }).select("_id");
       if (!order) return res.json({ data: [], total: 0, page, totalPages: 1 });
       filter.order = order._id;
+    } else if (scopedCashierId) {
+      const orderIds = await Order.find({
+        tenantId: authReq.user!.tenantId,
+        cashierId: scopedCashierId,
+      }).distinct("_id");
+      filter.order = { $in: orderIds };
     }
 
     const [data, total] = await Promise.all([
@@ -48,7 +60,7 @@ router.get("/", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/", async (req: Request, res: Response) => {
+router.post("/", requireRoles(["SHOP_ADMIN"]), async (req: Request, res: Response) => {
   const authReq = req as AuthRequest;
   const { orderId, items, reasonCode, note, refundAmount = 0, refundPaymentMethod = "CASH" } = req.body;
 
@@ -177,7 +189,7 @@ router.post("/", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/:returnId/items/:productId/restock", async (req: Request, res: Response) => {
+router.post("/:returnId/items/:productId/restock", requireRoles(["SHOP_ADMIN"]), async (req: Request, res: Response) => {
   const authReq = req as AuthRequest;
   const session = await mongoose.startSession();
   try {

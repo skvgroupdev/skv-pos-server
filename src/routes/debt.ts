@@ -12,6 +12,11 @@ const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
 router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
+const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
+    const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+    return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
+};
+
 router.get("/customers", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
@@ -19,6 +24,8 @@ router.get("/customers", async (req: Request, res: Response) => {
         const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
         const search = String(req.query.search || "").trim();
         const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
+        const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
+        const scopedCashierObjectId = scopedCashierId ? new mongoose.Types.ObjectId(scopedCashierId) : null;
         const match: any = { tenantId, totalDebt: { $gt: 0 } };
         if (search) {
             match.$or = [
@@ -42,6 +49,7 @@ router.get("/customers", async (req: Request, res: Response) => {
                                         { $eq: ["$tenantId", "$$tenantId"] },
                                         { $ne: ["$status", "CANCELLED"] },
                                         { $gt: ["$remainingAmount", 0] },
+                                        ...(scopedCashierObjectId ? [{ $eq: ["$cashierId", scopedCashierObjectId] }] : []),
                                     ],
                                 },
                             },
@@ -67,6 +75,8 @@ router.get("/customers", async (req: Request, res: Response) => {
                     orderDebt: { $ifNull: ["$debtStats.orderDebt", 0] },
                 },
             },
+            { $match: { unpaidOrders: { $gt: 0 } } },
+            ...(scopedCashierObjectId ? [{ $set: { totalDebt: "$orderDebt" } }] : []),
             { $project: { debtStats: 0 } },
             { $sort: { totalDebt: -1, updatedAt: -1 } },
             {
@@ -103,6 +113,7 @@ const generateReceiptNumber = () => {
 router.post("/repay", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
     const { customerId, orderId, paymentMethod, reference, note } = req.body;
+    const scopedCashierId = getScopedCashierId(authReq, req.body.cashierId);
 
     try {
         if (!customerId || !paymentMethod || !["CASH", "TRANSFER", "MIXED"].includes(paymentMethod)) {
@@ -156,8 +167,26 @@ router.post("/repay", async (req: Request, res: Response) => {
                     tenantId: authReq.user!.tenantId,
                 }).session(session);
                 if (!customer) throw Object.assign(new Error("Customer not found"), { statusCode: 404 });
-                if (repayAmount > customer.totalDebt) {
-                    throw Object.assign(new Error(`Amount exceeds customer debt (${customer.totalDebt})`), { statusCode: 400 });
+
+                let debtLimit = customer.totalDebt;
+                if (scopedCashierId) {
+                    const scopedDebt = await Order.aggregate([
+                        {
+                            $match: {
+                                customerId: customer._id,
+                                tenantId: new mongoose.Types.ObjectId(authReq.user!.tenantId),
+                                cashierId: new mongoose.Types.ObjectId(scopedCashierId),
+                                status: { $ne: "CANCELLED" },
+                                paymentStatus: { $in: ["UNPAID", "PARTIAL"] },
+                            },
+                        },
+                        { $group: { _id: null, total: { $sum: "$remainingAmount" } } },
+                    ]).session(session);
+                    debtLimit = scopedDebt[0]?.total || 0;
+                }
+
+                if (repayAmount > debtLimit) {
+                    throw Object.assign(new Error(`Amount exceeds customer debt (${debtLimit})`), { statusCode: 400 });
                 }
 
                 let remainingRepay = repayAmount;
@@ -171,6 +200,7 @@ router.post("/repay", async (req: Request, res: Response) => {
                         orderId,
                         customerId,
                         tenantId: authReq.user!.tenantId,
+                        ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
                         status: { $ne: "CANCELLED" },
                     }).session(session);
                     if (!linkedOrder) throw Object.assign(new Error("Order not found"), { statusCode: 404 });
@@ -191,6 +221,7 @@ router.post("/repay", async (req: Request, res: Response) => {
                     const unpaidOrders = await Order.find({
                         customerId,
                         tenantId: authReq.user!.tenantId,
+                        ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
                         status: { $ne: "CANCELLED" },
                         paymentStatus: { $in: ["UNPAID", "PARTIAL"] },
                     }).sort({ createdAt: 1 }).session(session);
@@ -275,10 +306,12 @@ router.get("/history/:customerId", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { customerId } = req.params;
+        const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
 
         const transactions = await DebtTransaction.find({
             customer: customerId,
-            tenantId: authReq.user!.tenantId
+            tenantId: authReq.user!.tenantId,
+            ...(scopedCashierId ? { processedBy: scopedCashierId } : {}),
         })
         .sort({ createdAt: -1 })
         .populate('order', 'orderId total saleMode paymentMethod')
@@ -295,16 +328,19 @@ router.get("/history/:customerId", async (req: Request, res: Response) => {
 router.get("/order-history/:orderId", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
+        const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
         const order = await Order.findOne({
             orderId: req.params.orderId,
-            tenantId: authReq.user!.tenantId
+            tenantId: authReq.user!.tenantId,
+            ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
         }).select("_id");
 
         if (!order) return res.json([]);
 
         const transactions = await DebtTransaction.find({
             order: order._id,
-            tenantId: authReq.user!.tenantId
+            tenantId: authReq.user!.tenantId,
+            ...(scopedCashierId ? { processedBy: scopedCashierId } : {}),
         })
             .sort({ createdAt: 1 })
             .populate('processedBy', 'username');
@@ -320,6 +356,7 @@ router.get("/transactions", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const { startDate, endDate, cashierId, paymentMethod } = req.query;
+        const scopedCashierId = getScopedCashierId(authReq, cashierId);
         const page = Math.max(1, Number(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
 
@@ -331,7 +368,7 @@ router.get("/transactions", async (req: Request, res: Response) => {
             if (endDate) filter.createdAt.$lte = new Date(endDate as string);
         }
 
-        if (cashierId) filter.processedBy = cashierId;
+        if (scopedCashierId) filter.processedBy = scopedCashierId;
         if (paymentMethod) filter.paymentMethod = paymentMethod;
 
         const [transactions, transactionCount] = await Promise.all([

@@ -58,10 +58,6 @@ export const normalizePaymentLines = (
     if (!Number.isFinite(amountInLAK) || amountInLAK <= 0) {
       throw new Error("Invalid LAK payment amount");
     }
-    if (method === "TRANSFER" && !reference) {
-      throw new Error("Transfer reference is required");
-    }
-
     return { method, currency, amount, rate, amountInLAK, reference };
   });
 };

@@ -6,7 +6,12 @@ import PaymentTransaction from "../models/PaymentTransaction";
 
 const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
-router.use(requireRoles(["SHOP_ADMIN"]));
+router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
+
+const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
+  const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+  return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
+};
 
 const orderDetailFields = [
   "orderId",
@@ -62,7 +67,7 @@ router.get("/", async (req: Request, res: Response) => {
     const paymentMethod = String(req.query.paymentMethod || "ALL");
     const currency = String(req.query.currency || "ALL");
     const saleMode = String(req.query.saleMode || "ALL");
-    const cashierId = req.query.cashierId ? String(req.query.cashierId) : "";
+    const cashierId = getScopedCashierId(authReq, req.query.cashierId);
     const search = String(req.query.search || "").trim();
     const dateFilter: any = {};
     if (req.query.startDate) dateFilter.$gte = new Date(String(req.query.startDate));
@@ -203,6 +208,7 @@ router.get("/", async (req: Request, res: Response) => {
         tenantId: authReq.user!.tenantId,
         status: "CANCELLED",
       };
+      if (cashierId) cancellationFilter.cashierId = cashierId;
       if (scopedSaleModeFilter) cancellationFilter.saleMode = scopedSaleModeFilter;
       if (Object.keys(dateFilter).length) {
         cancellationFilter.$or = [
@@ -263,15 +269,41 @@ router.get("/", async (req: Request, res: Response) => {
     );
     if (search) activities = activities.filter((activity) => matchesSearch(activity, search));
 
+    const seenSaleOrders = new Set<string>();
     const summary = activities.reduce(
       (acc, row: any) => {
         if (row.direction === "OUT") acc.moneyOut += row.appliedAmountInLAK || 0;
         else acc.moneyIn += row.appliedAmountInLAK || 0;
+        if (row.sourceType === "SALE" && row.order && row.order.status !== "CANCELLED") {
+          const orderKey = row.order._id?.toString?.() || row.order.orderId || row._id;
+          if (!seenSaleOrders.has(orderKey)) {
+            seenSaleOrders.add(orderKey);
+            acc.totalSales += row.order.total || 0;
+            acc.totalOrders += 1;
+            acc.totalDebt += row.order.remainingAmount || 0;
+            acc.actualReceivedFromOrders += row.appliedAmountInLAK || 0;
+          }
+        }
+        if (row.sourceType === "DEBT_REPAYMENT" && row.direction !== "OUT") {
+          acc.debtRepaymentIncome += row.appliedAmountInLAK || 0;
+          acc.debtRepaymentCount += 1;
+        }
         acc.change += row.changeInLAK || 0;
         acc.count += 1;
         return acc;
       },
-      { moneyIn: 0, moneyOut: 0, change: 0, count: 0 }
+      {
+        moneyIn: 0,
+        moneyOut: 0,
+        change: 0,
+        count: 0,
+        totalSales: 0,
+        actualReceivedFromOrders: 0,
+        totalOrders: 0,
+        totalDebt: 0,
+        debtRepaymentIncome: 0,
+        debtRepaymentCount: 0,
+      }
     );
     const total = activities.length;
     const data = activities.slice((page - 1) * limit, page * limit);
@@ -281,7 +313,11 @@ router.get("/", async (req: Request, res: Response) => {
       total,
       page,
       totalPages: Math.max(1, Math.ceil(total / limit)),
-      summary: { ...summary, net: summary.moneyIn - summary.moneyOut },
+      summary: {
+        ...summary,
+        totalIncomeToday: summary.actualReceivedFromOrders + summary.debtRepaymentIncome,
+        net: summary.moneyIn - summary.moneyOut,
+      },
     });
   } catch (error) {
     console.error("Financial transactions failed:", error);

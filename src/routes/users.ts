@@ -45,9 +45,9 @@ router.post("/", async (req: Request, res: Response) => {
       req.body
     );
     res.status(201).json(user);
-  } catch (error) {
+  } catch (error: any) {
     console.log(error);
-    res.status(400).json({ error: "Failed to create employee" });
+    res.status(400).json({ error: error.message || "Failed to create employee" });
   }
 });
 
@@ -60,8 +60,8 @@ router.put("/:id", async (req: Request, res: Response) => {
       req.body
     );
     res.json(user);
-  } catch (error) {
-    res.status(400).json({ error: "Failed to update employee" });
+  } catch (error: any) {
+    res.status(400).json({ error: error.message || "Failed to update employee" });
   }
 });
 

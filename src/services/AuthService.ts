@@ -5,8 +5,11 @@ import jwt from "jsonwebtoken";
 
 export class AuthService {
   static async login(username: string, password: string) {
-    // Removed tenantId
-    const user = await User.findOne({ username });
+    const rawUsername = String(username || "").trim();
+    const cleanUsername = rawUsername.toLowerCase();
+    const user =
+      (await User.findOne({ username: cleanUsername })) ||
+      (rawUsername !== cleanUsername ? await User.findOne({ username: rawUsername }) : null);
     if (!user) throw new Error("Invalid credentials");
 
     if (user.status !== 'ACTIVE') {
@@ -49,9 +52,18 @@ export class AuthService {
     roles?: string[];
   }) {
     const { tenantId, username, password, roles } = data;
+    const cleanUsername = String(username || "").trim().toLowerCase();
+
+    if (!cleanUsername) {
+      throw new Error("Username is required");
+    }
+
+    if (!password || password.length < 6) {
+      throw new Error("Password must be at least 6 characters");
+    }
 
     // Check if user exists in this tenant
-    const existingUser = await User.findOne({ tenantId, username });
+    const existingUser = await User.findOne({ tenantId, username: cleanUsername });
     if (existingUser) {
       throw new Error("Username already exists in this tenant");
     }
@@ -60,9 +72,9 @@ export class AuthService {
 
     const newUser = new User({
       tenantId,
-      username,
+      username: cleanUsername,
       passwordHash,
-      roles: roles || ["Employee"],
+      roles: roles || ["CASHIER"],
     });
 
     await newUser.save();
