@@ -58,6 +58,14 @@ const matchesSearch = (activity: any, search: string) => {
   return haystack.includes(search.toLowerCase());
 };
 
+const orderMigrationStatus = (order: any) =>
+  Array.isArray(order?.items) && order.items.length > 0 ? "COMPLETE" : "INCOMPLETE";
+
+const debtMigrationStatus = (debt: any) =>
+  debt?.amount > 0 && (debt?.paymentBreakdown?.length || debt?.paymentMethod) ? "COMPLETE" : "INCOMPLETE";
+
+const recordId = (value: any) => value?._id?.toString?.() || value?.toString?.() || "";
+
 router.get("/", async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
@@ -114,7 +122,9 @@ router.get("/", async (req: Request, res: Response) => {
         .lean();
 
       for (const order of orders) {
-        if (sourceKeys.has(`ORDER:${order._id.toString()}`)) continue;
+        const orderObjectId = order._id.toString();
+        if (sourceKeys.has(`ORDER:${orderObjectId}`)) continue;
+        if (ledgerRows.some((row: any) => row.order?._id?.toString?.() === orderObjectId && row.sourceType === "SALE")) continue;
         const payments = (order.payments || []).map((line: any) => ({
           method: order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH",
           currency: line.currency,
@@ -133,7 +143,7 @@ router.get("/", async (req: Request, res: Response) => {
           : order.paymentMethod === "DEBT" ? 0 : Number(order.paidAmount || 0);
         const initialApplied = Math.max(0, initialGross - Number(order.change || 0));
         legacyRows.push({
-          _id: `legacy-order-${order._id.toString()}`,
+          _id: `legacy-order-${orderObjectId}`,
           transactionId: order.orderId,
           sourceType: "SALE",
           direction: "IN",
@@ -146,7 +156,7 @@ router.get("/", async (req: Request, res: Response) => {
           appliedAmountInLAK: initialApplied,
           changeInLAK: order.change || 0,
           status: order.status === "CANCELLED" ? "REVERSED" : "POSTED",
-          migrationStatus: "INCOMPLETE",
+          migrationStatus: orderMigrationStatus(order),
           createdAt: order.createdAt,
         });
       }
@@ -171,7 +181,10 @@ router.get("/", async (req: Request, res: Response) => {
         .lean();
 
       for (const debt of debts) {
-        if (sourceKeys.has(`DEBT:${debt._id.toString()}`)) continue;
+        const debtObjectId = debt._id.toString();
+        const debtOrderId = recordId(debt.order);
+        if (sourceKeys.has(`DEBT:${debtObjectId}`)) continue;
+        if (ledgerRows.some((row: any) => recordId(row.order) === debtOrderId && row.sourceType === "DEBT_REPAYMENT" && row.appliedAmountInLAK === debt.amount)) continue;
         const fallbackMethod = debt.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH";
         const payments = debt.paymentBreakdown?.length ? debt.paymentBreakdown : [{
           method: fallbackMethod,
@@ -183,7 +196,7 @@ router.get("/", async (req: Request, res: Response) => {
         }];
         if (currency !== "ALL" && !payments.some((line: any) => line.currency === currency)) continue;
         legacyRows.push({
-          _id: `legacy-debt-${debt._id.toString()}`,
+          _id: `legacy-debt-${debtObjectId}`,
           transactionId: debt.receiptNumber || debt._id.toString(),
           sourceType: "DEBT_REPAYMENT",
           direction: "IN",
@@ -197,7 +210,7 @@ router.get("/", async (req: Request, res: Response) => {
           changeInLAK: 0,
           note: debt.note,
           status: "POSTED",
-          migrationStatus: "INCOMPLETE",
+          migrationStatus: debtMigrationStatus(debt),
           createdAt: debt.createdAt,
         });
       }
@@ -225,7 +238,9 @@ router.get("/", async (req: Request, res: Response) => {
         .lean();
 
       for (const order of cancelledOrders) {
-        if (sourceKeys.has(`CANCEL:${order._id.toString()}`)) continue;
+        const orderObjectId = order._id.toString();
+        if (sourceKeys.has(`CANCEL:${orderObjectId}`)) continue;
+        if (ledgerRows.some((row: any) => row.order?._id?.toString?.() === orderObjectId && row.sourceType === "REVERSAL")) continue;
         const payments = (order.payments || []).map((line: any) => ({
           method: line.method || (order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH"),
           currency: line.currency,
@@ -243,7 +258,7 @@ router.get("/", async (req: Request, res: Response) => {
         if (paymentMethod !== "ALL" && paymentMethod !== (order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH")) continue;
         if (currency !== "ALL" && !payments.some((line: any) => line.currency === currency)) continue;
         legacyRows.push({
-          _id: `legacy-cancel-${order._id.toString()}`,
+          _id: `legacy-cancel-${orderObjectId}`,
           transactionId: `CANCEL-${order.orderId}`,
           sourceType: "REVERSAL",
           direction: "OUT",
@@ -258,7 +273,7 @@ router.get("/", async (req: Request, res: Response) => {
           note: order.cancelReason,
           reasonCode: order.cancelReasonCode,
           status: "POSTED",
-          migrationStatus: "INCOMPLETE",
+          migrationStatus: orderMigrationStatus(order),
           createdAt: order.cancelledAt || order.updatedAt,
         });
       }

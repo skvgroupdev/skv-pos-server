@@ -9,7 +9,12 @@ import mongoose from "mongoose";
 
 const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
-router.use(requireRoles(["SHOP_ADMIN"]));
+
+const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
+    const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+    const cashierId = isManager ? String(requestedCashierId || "") : authReq.user!.userId;
+    return mongoose.Types.ObjectId.isValid(cashierId) ? cashierId : "";
+};
 
 // Helper: Parse Date Range
 const getDateRange = (req: Request) => {
@@ -35,6 +40,7 @@ const getMatchQuery = (req: Request) => {
     const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
     const { start, end } = getDateRange(req);
     const { cashierId, saleMode } = req.query;
+    const scopedCashierId = getScopedCashierId(authReq, cashierId);
 
     const match: any = {
         tenantId,
@@ -42,8 +48,8 @@ const getMatchQuery = (req: Request) => {
         status: { $ne: 'CANCELLED' }
     };
 
-    if (cashierId) {
-        match.cashierId = new mongoose.Types.ObjectId(cashierId as string);
+    if (scopedCashierId) {
+        match.cashierId = new mongoose.Types.ObjectId(scopedCashierId);
     }
     if (saleMode === "retail") match.saleMode = { $in: ["retail", null] };
     if (saleMode === "wholesale") match.saleMode = "wholesale";
@@ -52,22 +58,34 @@ const getMatchQuery = (req: Request) => {
 };
 
 // 1. GET /summary
-router.get("/summary", async (req: Request, res: Response) => {
+router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
         const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
         const match = getMatchQuery(req);
+        const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
+        const scopedCashierObjectId = scopedCashierId ? new mongoose.Types.ObjectId(scopedCashierId) : undefined;
         const requestedSaleMode = req.query.saleMode === "retail" || req.query.saleMode === "wholesale"
             ? req.query.saleMode
             : undefined;
-        const scopedOrderIds = requestedSaleMode
-            ? await Order.find({
-                tenantId,
-                saleMode: requestedSaleMode === "retail" ? { $in: ["retail", null] } : "wholesale",
-            }).distinct("_id")
+        const scopedOrderQuery: any = { tenantId };
+        if (requestedSaleMode) {
+            scopedOrderQuery.saleMode = requestedSaleMode === "retail" ? { $in: ["retail", null] } : "wholesale";
+        }
+        if (scopedCashierObjectId) {
+            scopedOrderQuery.cashierId = scopedCashierObjectId;
+        }
+        const scopedOrderIds = requestedSaleMode || scopedCashierObjectId
+            ? await Order.find(scopedOrderQuery).distinct("_id")
             : undefined;
         const cashflowOrderMatch: any = { ...match };
         delete cashflowOrderMatch.status;
+        const scopedTransactionFilter = {
+            ...(scopedCashierObjectId ? { processedBy: scopedCashierObjectId } : {}),
+            ...(scopedOrderIds && (!scopedCashierObjectId || requestedSaleMode)
+                ? { order: { $in: scopedOrderIds } }
+                : {}),
+        };
         const initialOrderReceiptExpression: any = {
             $max: [
                 0,
@@ -112,7 +130,7 @@ router.get("/summary", async (req: Request, res: Response) => {
                     tenantId: new mongoose.Types.ObjectId(authReqForDebt.user!.tenantId),
                     type: "DEBIT",
                     createdAt: { $gte: debtStart, $lte: debtEnd },
-                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                    ...scopedTransactionFilter
                 }
             },
             {
@@ -135,7 +153,7 @@ router.get("/summary", async (req: Request, res: Response) => {
                     status: "POSTED",
                     sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
                     createdAt: { $gte: debtStart, $lte: debtEnd },
-                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                    ...scopedTransactionFilter
                 }
             },
             {
@@ -187,7 +205,7 @@ router.get("/summary", async (req: Request, res: Response) => {
                     tenantId,
                     type: "DEBIT",
                     createdAt: { $gte: debtStart, $lte: debtEnd },
-                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                    ...scopedTransactionFilter
                 }
             },
             {
@@ -318,7 +336,7 @@ router.get("/summary", async (req: Request, res: Response) => {
                     direction: "OUT",
                     status: "POSTED",
                     createdAt: { $gte: debtStart, $lte: debtEnd },
-                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                    ...scopedTransactionFilter
                 }
             },
             {
@@ -336,7 +354,7 @@ router.get("/summary", async (req: Request, res: Response) => {
                     sourceType: "SALE",
                     direction: "IN",
                     createdAt: { $gte: debtStart, $lte: debtEnd },
-                    ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {})
+                    ...scopedTransactionFilter
                 }
             },
             {
@@ -579,6 +597,8 @@ router.get("/summary", async (req: Request, res: Response) => {
         res.status(500).json({ error: "Failed to fetch summary" });
     }
 });
+
+router.use(requireRoles(["SHOP_ADMIN"]));
 
 // 2. GET /sales-trends
 router.get("/sales-trends", async (req: Request, res: Response) => {

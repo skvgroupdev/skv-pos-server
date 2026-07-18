@@ -39,6 +39,7 @@ export class AuthService {
       token, 
       user: {
         ...userObj,
+        id: user._id.toString(),
         subscriptionPlan: tenant?.subscriptionPlan || 'BASIC'
       } 
     };
@@ -94,6 +95,12 @@ export class AuthService {
     // For now keeping it simple as per request mainly focusing on login.
     // The user might want register to also return it, but the request emphasized Login.
     
-    return { token, user: newUser };
+    return {
+      token,
+      user: {
+        ...newUser.toObject(),
+        id: newUser._id.toString(),
+      },
+    };
   }
 }

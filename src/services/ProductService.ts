@@ -44,7 +44,10 @@ export class ProductService {
     }
   ) {
     const skip = (page - 1) * limit;
-    const query: any = { tenantId };
+    const tenantObjectId = mongoose.Types.ObjectId.isValid(tenantId)
+      ? new mongoose.Types.ObjectId(tenantId)
+      : tenantId;
+    const query: any = { tenantId: tenantObjectId };
 
     if (search) {
       // Advanced Search Logic (Barcode has priority)
@@ -116,12 +119,82 @@ export class ProductService {
       }
     }
 
-    const [products, total] = await Promise.all([
+    const summaryPipeline = [
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalItems: { $sum: 1 },
+          totalProducts: { $sum: { $ifNull: ["$stock", 0] } },
+          lowStock: {
+            $sum: {
+              $cond: [
+                { $lte: [{ $ifNull: ["$stock", 0] }, { $ifNull: ["$minStock", 0] }] },
+                1,
+                0,
+              ],
+            },
+          },
+          totalValue: {
+            $sum: {
+              $multiply: [
+                { $ifNull: ["$costPrice", 0] },
+                { $ifNull: ["$stock", 0] },
+              ],
+            },
+          },
+          potentialProfit: {
+            $sum: {
+              $multiply: [
+                { $subtract: [{ $ifNull: ["$sellPrice", 0] }, { $ifNull: ["$costPrice", 0] }] },
+                { $ifNull: ["$stock", 0] },
+              ],
+            },
+          },
+          projectedRevenue: {
+            $sum: {
+              $multiply: [
+                {
+                  $cond: [
+                    { $gt: [{ $ifNull: ["$wholesalePrice", 0] }, 0] },
+                    { $ifNull: ["$wholesalePrice", 0] },
+                    { $ifNull: ["$sellPrice", 0] },
+                  ],
+                },
+                { $ifNull: ["$stock", 0] },
+              ],
+            },
+          },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          totalItems: 1,
+          totalProducts: { $round: ["$totalProducts", 0] },
+          lowStock: 1,
+          totalValue: { $round: ["$totalValue", 0] },
+          potentialProfit: { $round: ["$potentialProfit", 0] },
+          projectedRevenue: { $round: ["$projectedRevenue", 0] },
+        },
+      },
+    ];
+
+    const [products, total, summaryResult] = await Promise.all([
       Product.find(query).sort(sortOption).skip(skip).limit(limit),
       Product.countDocuments(query),
+      Product.aggregate(summaryPipeline as any),
     ]);
     return {
       data: products,
+      summary: summaryResult[0] || {
+        lowStock: 0,
+        potentialProfit: 0,
+        projectedRevenue: 0,
+        totalItems: 0,
+        totalProducts: 0,
+        totalValue: 0,
+      },
       pagination: {
         total,
         page,
