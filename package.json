@@ -12,6 +12,10 @@
     "seed:employees": "ts-node src/scripts/init-shop-employees.ts",
     "backup:run": "ts-node src/scripts/run-backup.ts",
     "migrate:payment-ledger": "ts-node src/scripts/backfill-payment-ledger.ts",
+    "audit:user-login-phones": "ts-node src/scripts/backfill-user-login-phones.ts",
+    "migrate:user-login-phones": "ts-node src/scripts/backfill-user-login-phones.ts --apply",
+    "test:user-identity": "node --test -r ts-node/register src/utils/userIdentity.test.ts",
+    "verify:todo-user-flow": "ts-node src/scripts/verify-todo-user-flow.ts",
     "dev": "nodemon --exec ts-node src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js"

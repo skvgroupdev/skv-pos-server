@@ -2,14 +2,44 @@ import User, { IUser } from "../models/User";
 import Tenant from "../models/Tenant";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import {
+  buildLoosePhoneRegex,
+  normalizeLaoMobilePhone,
+  normalizeUsername,
+} from "../utils/userIdentity";
+
+const findUserForLogin = async (identifier: string) => {
+  const normalizedPhone = normalizeLaoMobilePhone(identifier);
+  if (normalizedPhone) {
+    const users = await User.find({
+      $or: [
+        { loginPhone: normalizedPhone },
+        { phone: buildLoosePhoneRegex(normalizedPhone) },
+      ],
+    }).limit(2);
+
+    if (users.length > 1) {
+      throw new Error("Phone number is linked to multiple accounts. Please contact the shop administrator.");
+    }
+    return users[0] || null;
+  }
+
+  const rawUsername = String(identifier || "").trim();
+  const cleanUsername = normalizeUsername(rawUsername);
+  const usernameCandidates = rawUsername !== cleanUsername
+    ? [cleanUsername, rawUsername]
+    : [cleanUsername];
+  const users = await User.find({ username: { $in: usernameCandidates } }).limit(2);
+
+  if (users.length > 1) {
+    throw new Error("Username exists in multiple shops. Please log in with your phone number.");
+  }
+  return users[0] || null;
+};
 
 export class AuthService {
-  static async login(username: string, password: string) {
-    const rawUsername = String(username || "").trim();
-    const cleanUsername = rawUsername.toLowerCase();
-    const user =
-      (await User.findOne({ username: cleanUsername })) ||
-      (rawUsername !== cleanUsername ? await User.findOne({ username: rawUsername }) : null);
+  static async login(identifier: string, password: string) {
+    const user = await findUserForLogin(identifier);
     if (!user) throw new Error("Invalid credentials");
 
     if (user.status !== 'ACTIVE') {
@@ -34,6 +64,7 @@ export class AuthService {
 
     // Return user with subscriptionPlan
     const userObj = user.toObject();
+    delete (userObj as Partial<IUser>).passwordHash;
     
     const response = { 
       token, 
@@ -53,7 +84,7 @@ export class AuthService {
     roles?: string[];
   }) {
     const { tenantId, username, password, roles } = data;
-    const cleanUsername = String(username || "").trim().toLowerCase();
+    const cleanUsername = normalizeUsername(username);
 
     if (!cleanUsername) {
       throw new Error("Username is required");

@@ -10,6 +10,7 @@ export interface IUser extends Document {
   status: 'ACTIVE' | 'INACTIVE';
   employeeCode?: string;
   phone?: string;
+  loginPhone?: string;
   address?: string;
   userid: string;
   createdAt: Date;
@@ -30,6 +31,7 @@ const UserSchema: Schema = new Schema(
     status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
     employeeCode: { type: String, default: "" },
     phone: { type: String, default: "" },
+    loginPhone: { type: String, trim: true },
     address: { type: String, default: "" },
     userid: {
       type: String,
@@ -41,5 +43,6 @@ const UserSchema: Schema = new Schema(
 );
 
 UserSchema.index({ tenantId: 1, username: 1 }, { unique: true });
+UserSchema.index({ loginPhone: 1 }, { unique: true, sparse: true });
 
 export default mongoose.model<IUser>("User", UserSchema);

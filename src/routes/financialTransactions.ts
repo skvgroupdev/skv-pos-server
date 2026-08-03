@@ -13,6 +13,26 @@ const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) 
   return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
 };
 
+const isManagerRequest = (authReq: AuthRequest) =>
+  authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+
+const withoutCostFields = (activity: any) => {
+  const order = activity.order
+    ? {
+        ...activity.order,
+        items: (activity.order.items || []).map((item: any) => {
+          const safeItem = { ...item };
+          delete safeItem.cost;
+          return safeItem;
+        }),
+      }
+    : activity.order;
+  const safeActivity = { ...activity };
+  delete safeActivity.approvedBy;
+  delete safeActivity.approvedAt;
+  return { ...safeActivity, order };
+};
+
 const orderDetailFields = [
   "orderId",
   "total",
@@ -294,6 +314,12 @@ router.get("/", async (req: Request, res: Response) => {
           if (!seenSaleOrders.has(orderKey)) {
             seenSaleOrders.add(orderKey);
             acc.totalSales += row.order.total || 0;
+            acc.totalDiscount += row.order.discount || 0;
+            acc.totalCost += (row.order.items || []).reduce(
+              (sum: number, item: any) =>
+                sum + (Number(item.cost) || 0) * (Number(item.quantity) || 0),
+              0
+            );
             acc.totalOrders += 1;
             acc.totalDebt += row.order.remainingAmount || 0;
             acc.actualReceivedFromOrders += row.appliedAmountInLAK || 0;
@@ -313,6 +339,8 @@ router.get("/", async (req: Request, res: Response) => {
         change: 0,
         count: 0,
         totalSales: 0,
+        totalDiscount: 0,
+        totalCost: 0,
         actualReceivedFromOrders: 0,
         totalOrders: 0,
         totalDebt: 0,
@@ -322,17 +350,34 @@ router.get("/", async (req: Request, res: Response) => {
     );
     const total = activities.length;
     const data = activities.slice((page - 1) * limit, page * limit);
+    const grossSales = summary.totalSales + summary.totalDiscount;
+    const netProfit = summary.totalSales - summary.totalCost;
 
-    res.json({
-      data,
+    const fullSummary = {
+      ...summary,
+      grossSales,
+      netSales: summary.totalSales,
+      netProfit,
+      // Compatibility alias for report consumers that still read totalProfit.
+      totalProfit: netProfit,
+      totalIncomeToday: summary.actualReceivedFromOrders + summary.debtRepaymentIncome,
+      net: summary.moneyIn - summary.moneyOut,
+    };
+    const managerRequest = isManagerRequest(authReq);
+
+    return res.json({
+      data: managerRequest ? data : data.map(withoutCostFields),
       total,
       page,
       totalPages: Math.max(1, Math.ceil(total / limit)),
-      summary: {
-        ...summary,
-        totalIncomeToday: summary.actualReceivedFromOrders + summary.debtRepaymentIncome,
-        net: summary.moneyIn - summary.moneyOut,
-      },
+      summary: managerRequest
+        ? fullSummary
+        : {
+            totalSales: summary.totalSales,
+            totalOrders: summary.totalOrders,
+            totalDiscount: summary.totalDiscount,
+            avgOrderValue: summary.totalSales / (summary.totalOrders || 1),
+          },
     });
   } catch (error) {
     console.error("Financial transactions failed:", error);

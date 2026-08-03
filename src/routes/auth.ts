@@ -21,8 +21,8 @@ router.post("/register", async (req, res) => {
 
 router.post("/login", async (req, res) => {
   try {
-    const { username, password } = req.body;
-    const result = await AuthService.login(username, password);
+    const { username, identifier, password } = req.body;
+    const result = await AuthService.login(identifier || username, password);
     res.json(result);
   } catch (error: any) {
     res.status(401).json({ error: error.message });

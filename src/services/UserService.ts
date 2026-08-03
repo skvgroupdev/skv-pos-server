@@ -1,9 +1,22 @@
 import User, { IUser } from "../models/User";
 import bcrypt from "bcrypt";
+import {
+  buildLoosePhoneRegex,
+  normalizeLaoMobilePhone,
+  normalizeUsername,
+} from "../utils/userIdentity";
 
 const EMPLOYEE_ROLES = ["SHOP_ADMIN", "CASHIER", "STOCK_KEEPER", "SALES"];
 
-const normalizeUsername = (value: unknown) => String(value || "").trim().toLowerCase();
+interface EmployeeInput {
+  username?: unknown;
+  password?: unknown;
+  roles?: unknown;
+  employeeCode?: unknown;
+  phone?: unknown;
+  address?: unknown;
+  userid?: unknown;
+}
 
 const normalizePassword = (value: unknown) => String(value || "");
 
@@ -23,9 +36,17 @@ const validatePassword = (password: string) => {
     throw new Error("Password is required");
   }
 
-  if (password.length < 6) {
-    throw new Error("Password must be at least 6 characters");
+  if (password.length < 7) {
+    throw new Error("Password must be at least 7 characters");
   }
+};
+
+const requireLoginPhone = (value: unknown) => {
+  const loginPhone = normalizeLaoMobilePhone(value);
+  if (!loginPhone) {
+    throw new Error("Phone must use the format 20xxxxxxxx");
+  }
+  return loginPhone;
 };
 
 export class UserService {
@@ -56,10 +77,11 @@ export class UserService {
     };
   }
 
-  static async createEmployee(tenantId: string, data: any) {
+  static async createEmployee(tenantId: string, data: EmployeeInput) {
     const { username, password, roles, employeeCode, phone, address, userid } = data;
     const cleanUsername = normalizeUsername(username);
     const cleanPassword = normalizePassword(password);
+    const loginPhone = requireLoginPhone(phone);
 
     if (!cleanUsername) {
       throw new Error("Username is required");
@@ -67,9 +89,20 @@ export class UserService {
 
     validatePassword(cleanPassword);
 
-    const existingUser = await User.findOne({ tenantId, username: cleanUsername });
+    const [existingUser, existingPhone] = await Promise.all([
+      User.findOne({ tenantId, username: cleanUsername }).select("_id"),
+      User.findOne({
+        $or: [
+          { loginPhone },
+          { phone: buildLoosePhoneRegex(loginPhone) },
+        ],
+      }).select("_id"),
+    ]);
     if (existingUser) {
       throw new Error("Username already exists");
+    }
+    if (existingPhone) {
+      throw new Error("Phone number already belongs to another account");
     }
 
     const passwordHash = await bcrypt.hash(cleanPassword, 10);
@@ -79,7 +112,8 @@ export class UserService {
       passwordHash,
       roles: normalizeRoles(roles),
       employeeCode,
-      phone,
+      phone: loginPhone,
+      loginPhone,
       address,
       userid
     });
@@ -90,28 +124,59 @@ export class UserService {
     return savedUser;
   }
 
-  static async updateEmployee(tenantId: string, id: string, data: any) {
-    if (data.username) {
-      data.username = normalizeUsername(data.username);
-      if (!data.username) {
+  static async updateEmployee(tenantId: string, id: string, data: EmployeeInput) {
+    const updates: Record<string, unknown> = {};
+
+    if (data.username !== undefined) {
+      const cleanUsername = normalizeUsername(data.username);
+      if (!cleanUsername) {
         throw new Error("Username is required");
       }
+      const existingUser = await User.findOne({
+        tenantId,
+        username: cleanUsername,
+        _id: { $ne: id },
+      }).select("_id");
+      if (existingUser) {
+        throw new Error("Username already exists");
+      }
+      updates.username = cleanUsername;
     }
 
-    if (data.roles) {
-      data.roles = normalizeRoles(data.roles);
+    if (data.roles !== undefined) {
+      updates.roles = normalizeRoles(data.roles);
     }
 
     if (data.password) {
       const cleanPassword = normalizePassword(data.password);
       validatePassword(cleanPassword);
-      data.passwordHash = await bcrypt.hash(cleanPassword, 10);
-      delete data.password;
-    } else {
-      delete data.password;
+      updates.passwordHash = await bcrypt.hash(cleanPassword, 10);
     }
 
-    const user = await User.findOneAndUpdate({ _id: id, tenantId }, data, {
+    if (data.phone !== undefined) {
+      const loginPhone = requireLoginPhone(data.phone);
+      const existingPhone = await User.findOne({
+        _id: { $ne: id },
+        $or: [
+          { loginPhone },
+          { phone: buildLoosePhoneRegex(loginPhone) },
+        ],
+      }).select("_id");
+      if (existingPhone) {
+        throw new Error("Phone number already belongs to another account");
+      }
+      updates.phone = loginPhone;
+      updates.loginPhone = loginPhone;
+    }
+
+    if (data.employeeCode !== undefined) {
+      updates.employeeCode = String(data.employeeCode || "").trim();
+    }
+    if (data.address !== undefined) {
+      updates.address = String(data.address || "").trim();
+    }
+
+    const user = await User.findOneAndUpdate({ _id: id, tenantId }, updates, {
       new: true,
     }).select("-passwordHash");
     if (!user) throw new Error("User not found");

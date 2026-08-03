@@ -16,6 +16,9 @@ const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) 
     return mongoose.Types.ObjectId.isValid(cashierId) ? cashierId : "";
 };
 
+const isManagerRequest = (authReq: AuthRequest) =>
+    authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+
 // Helper: Parse Date Range
 const getDateRange = (req: Request) => {
     const { startDate, endDate } = req.query;
@@ -480,7 +483,12 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         const debtRepaymentIncome = debtRepaymentResult[0]?.totalRepaid || 0;
         const debtRepaymentCount  = debtRepaymentResult[0]?.count || 0;
 
-        // totalSales = all orders' net total (includes DEBT order face value)
+        // Sales reporting contract:
+        // grossSales = price before the order-level discount
+        // totalSales/netSales = price after discount (Order.total)
+        // netProfit = netSales - cost of the sold items
+        // `totalProfit` remains as a compatibility alias for existing clients.
+        // totalSales includes DEBT order face value, regardless of when cash is received.
         // actualReceivedFromOrders = only money actually handed over at time of sale
         // totalIncomeToday = actualReceivedFromOrders + debtRepaymentIncome
         const stats = {
@@ -537,8 +545,9 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             });
         }
 
-        const cost = itemsResult[0]?.totalCost || 0;
-        const totalProfit = stats.totalSales - cost;
+        const grossSales = stats.totalSales + stats.totalDiscount;
+        const totalCost = itemsResult[0]?.totalCost || 0;
+        const netProfit = stats.totalSales - totalCost;
 
         // Calculate Profit by Category
         const categoryMap: any = {};
@@ -557,10 +566,13 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
 
         const breakdownBySaleMode = saleModeResult.map((r: any) => ({
             mode: r._id || "retail",
+            grossSales: r.totalSales + r.totalDiscount,
             totalSales: r.totalSales,
+            netSales: r.totalSales,
             totalOrders: r.totalOrders,
             totalDiscount: r.totalDiscount,
             totalCost: r.totalCost,
+            netProfit: r.totalSales - r.totalCost,
             totalProfit: r.totalSales - r.totalCost,
             avgOrderValue: r.totalOrders > 0 ? r.totalSales / r.totalOrders : 0
         }));
@@ -571,16 +583,59 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             sales: r.sales
         }));
 
-        res.json({
+        const cancelledOrders = cancellationResult[0] || { count: 0, amount: 0 };
+        const returns = returnResult[0] || { count: 0, units: 0, value: 0, damagedCost: 0 };
+        const cashierReceivedByMethod = breakdownByMethod
+            .filter((breakdown) => breakdown.method === "CASH" || breakdown.method === "TRANSFER")
+            .map((breakdown) => ({
+                method: breakdown.method,
+                totalReceived: breakdown.totalPaid,
+                transactionCount: breakdown.totalOrders,
+            }));
+
+        if (!isManagerRequest(authReq)) {
+            return res.json({
+                totalSales: stats.totalSales,
+                totalOrders: stats.totalOrders,
+                totalDiscount: stats.totalDiscount,
+                avgOrderValue: stats.avgOrderValue,
+                breakdownBySaleMode: breakdownBySaleMode.map((breakdown) => ({
+                    mode: breakdown.mode,
+                    totalSales: breakdown.totalSales,
+                    totalOrders: breakdown.totalOrders,
+                    totalDiscount: breakdown.totalDiscount,
+                    avgOrderValue: breakdown.avgOrderValue,
+                })),
+                receivedByMethod: cashierReceivedByMethod,
+                breakdownByMethod: breakdownByMethod.map((breakdown) => ({
+                    method: breakdown.method,
+                    totalSales: breakdown.totalSales,
+                    totalPaid: breakdown.totalPaid,
+                    totalOrders: breakdown.totalOrders,
+                    totalDebt: breakdown.totalDebt,
+                    totalDiscount: breakdown.totalDiscount,
+                    totalChange: breakdown.totalChange,
+                    netRevenue: breakdown.netRevenue,
+                })),
+                hourlyBreakdown,
+                cancelledOrders: { count: cancelledOrders.count || 0 },
+                returns: { count: returns.count || 0, units: returns.units || 0 },
+            });
+        }
+
+        return res.json({
             ...stats,
-            totalProfit,
+            grossSales,
+            netSales: stats.totalSales,
+            totalCost,
+            netProfit,
+            totalProfit: netProfit,
             receivedBreakdown,
             receivedByMethod,
             profitByCategory,
             breakdownByMethod,
             breakdownBySaleMode,
             hourlyBreakdown,
-            netSales: stats.totalSales,
             // ยอดรายรับจริง (ไม่นับ DEBT ที่ยังไม่จ่าย)
             actualReceivedFromOrders,
             debtRepaymentIncome,
@@ -589,8 +644,8 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             refundAmount: refunds,
             reversalAmount: reversals,
             netCashFlow: totalIncomeToday - moneyOut,
-            cancelledOrders: cancellationResult[0] || { count: 0, amount: 0 },
-            returns: returnResult[0] || { count: 0, units: 0, value: 0, damagedCost: 0 }
+            cancelledOrders,
+            returns
         });
     } catch (error) {
         console.error("Report Summary Error:", error);
