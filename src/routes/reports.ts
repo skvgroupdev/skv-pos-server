@@ -160,11 +160,41 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 }
             },
             {
+                $lookup: {
+                    from: "orders",
+                    localField: "order",
+                    foreignField: "_id",
+                    as: "orderInfo"
+                }
+            },
+            { $unwind: { path: "$orderInfo", preserveNullAndEmptyArrays: true } },
+            {
+                $set: {
+                    reportAppliedAmountInLAK: {
+                        $cond: [
+                            { $and: [{ $eq: ["$sourceType", "SALE"] }, { $eq: ["$orderInfo.paymentMethod", "DEBT"] }] },
+                            {
+                                $max: [
+                                    0,
+                                    {
+                                        $subtract: [
+                                            { $sum: { $map: { input: { $ifNull: ["$orderInfo.payments", []] }, as: "payment", in: { $ifNull: ["$$payment.amountInLAK", 0] } } } },
+                                            { $ifNull: ["$orderInfo.change", 0] }
+                                        ]
+                                    }
+                                ]
+                            },
+                            "$appliedAmountInLAK"
+                        ]
+                    }
+                }
+            },
+            {
                 $set: {
                     appliedRatio: {
                         $cond: [
                             { $gt: ["$grossReceivedInLAK", 0] },
-                            { $divide: ["$appliedAmountInLAK", "$grossReceivedInLAK"] },
+                            { $divide: ["$reportAppliedAmountInLAK", "$grossReceivedInLAK"] },
                             0
                         ]
                     }
@@ -361,9 +391,39 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 }
             },
             {
+                $lookup: {
+                    from: "orders",
+                    localField: "order",
+                    foreignField: "_id",
+                    as: "orderInfo"
+                }
+            },
+            { $unwind: { path: "$orderInfo", preserveNullAndEmptyArrays: true } },
+            {
+                $set: {
+                    reportAppliedAmountInLAK: {
+                        $cond: [
+                            { $eq: ["$orderInfo.paymentMethod", "DEBT"] },
+                            {
+                                $max: [
+                                    0,
+                                    {
+                                        $subtract: [
+                                            { $sum: { $map: { input: { $ifNull: ["$orderInfo.payments", []] }, as: "payment", in: { $ifNull: ["$$payment.amountInLAK", 0] } } } },
+                                            { $ifNull: ["$orderInfo.change", 0] }
+                                        ]
+                                    }
+                                ]
+                            },
+                            "$appliedAmountInLAK"
+                        ]
+                    }
+                }
+            },
+            {
                 $group: {
                     _id: null,
-                    amount: { $sum: "$appliedAmountInLAK" },
+                    amount: { $sum: "$reportAppliedAmountInLAK" },
                     orderIds: { $addToSet: "$order" }
                 }
             }
@@ -417,7 +477,8 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                                     $and: [
                                         { $eq: ["$order", "$$orderId"] },
                                         { $eq: ["$tenantId", "$$tenantId"] },
-                                        { $eq: ["$sourceType", "REVERSAL"] }
+                                        { $eq: ["$sourceType", "REVERSAL"] },
+                                        { $eq: ["$status", "POSTED"] }
                                     ]
                                 }
                             }
@@ -484,13 +545,12 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         const debtRepaymentCount  = debtRepaymentResult[0]?.count || 0;
 
         // Sales reporting contract:
-        // grossSales = price before the order-level discount
-        // totalSales/netSales = price after discount (Order.total)
-        // netProfit = netSales - cost of the sold items
+        // grossSales/grossBillSales = bill value before the order-level discount.
+        // totalSales/netBillSales = bill value after discount (Order.total), before refunds.
+        // cashInFromNewBills = only money actually handed over at time of sale.
+        // debtRepaymentIncome = repayments by repayment date, not original order date.
+        // netCashReceived = cash in from new bills + debt repayments - refunds/reversals.
         // `totalProfit` remains as a compatibility alias for existing clients.
-        // totalSales includes DEBT order face value, regardless of when cash is received.
-        // actualReceivedFromOrders = only money actually handed over at time of sale
-        // totalIncomeToday = actualReceivedFromOrders + debtRepaymentIncome
         const stats = {
             totalSales:    breakdownByMethod.reduce((sum, b) => sum + b.totalSales, 0),
             totalOrders:   breakdownByMethod.reduce((sum, b) => sum + b.totalOrders, 0),
@@ -514,6 +574,8 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             .reduce((sum: number, row: any) => sum + row.amount, 0);
         const reversals = reversalsFromLedger + (legacyCancellationResult[0]?.amount || 0);
         const moneyOut = refunds + reversals;
+        const cashInFromNewBills = actualReceivedFromOrders;
+        const netCashReceived = totalIncomeToday - moneyOut;
 
         // Adjust received breakdown: subtract change from LAK
         const totalChange = stats.totalChange;
@@ -546,8 +608,11 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         }
 
         const grossSales = stats.totalSales + stats.totalDiscount;
+        const netBillSales = stats.totalSales;
+        const netSalesAfterAdjustments = Math.max(0, netBillSales - moneyOut);
         const totalCost = itemsResult[0]?.totalCost || 0;
         const netProfit = stats.totalSales - totalCost;
+        const netProfitAfterAdjustments = netProfit - moneyOut;
 
         // Calculate Profit by Category
         const categoryMap: any = {};
@@ -626,9 +691,14 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         return res.json({
             ...stats,
             grossSales,
+            grossBillSales: grossSales,
             netSales: stats.totalSales,
+            netBillSales,
+            netSalesAfterAdjustments,
+            discountAmount: stats.totalDiscount,
             totalCost,
             netProfit,
+            netProfitAfterAdjustments,
             totalProfit: netProfit,
             receivedBreakdown,
             receivedByMethod,
@@ -638,12 +708,15 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             hourlyBreakdown,
             // ยอดรายรับจริง (ไม่นับ DEBT ที่ยังไม่จ่าย)
             actualReceivedFromOrders,
+            cashInFromNewBills,
             debtRepaymentIncome,
             debtRepaymentCount,
             totalIncomeToday,
+            moneyOut,
             refundAmount: refunds,
             reversalAmount: reversals,
-            netCashFlow: totalIncomeToday - moneyOut,
+            netCashReceived,
+            netCashFlow: netCashReceived,
             cancelledOrders,
             returns
         });

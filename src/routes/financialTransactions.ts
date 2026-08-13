@@ -259,8 +259,7 @@ router.get("/", async (req: Request, res: Response) => {
 
       for (const order of cancelledOrders) {
         const orderObjectId = order._id.toString();
-        if (sourceKeys.has(`CANCEL:${orderObjectId}`)) continue;
-        if (ledgerRows.some((row: any) => row.order?._id?.toString?.() === orderObjectId && row.sourceType === "REVERSAL")) continue;
+        if (ledgerRows.some((row: any) => row.order?._id?.toString?.() === orderObjectId && row.sourceType === "REVERSAL" && row.status === "POSTED")) continue;
         const payments = (order.payments || []).map((line: any) => ({
           method: line.method || (order.paymentMethod === "TRANSFER" ? "TRANSFER" : "CASH"),
           currency: line.currency,
@@ -307,8 +306,16 @@ router.get("/", async (req: Request, res: Response) => {
     const seenSaleOrders = new Set<string>();
     const summary = activities.reduce(
       (acc, row: any) => {
-        if (row.direction === "OUT") acc.moneyOut += row.appliedAmountInLAK || 0;
-        else acc.moneyIn += row.appliedAmountInLAK || 0;
+        const orderPaymentSnapshot = (row.order?.payments || []).reduce(
+          (sum: number, line: any) => sum + (Number(line.amountInLAK) || 0),
+          0
+        );
+        const reportAppliedAmount =
+          row.sourceType === "SALE" && row.order?.paymentMethod === "DEBT"
+            ? Math.max(0, orderPaymentSnapshot - Number(row.order?.change || 0))
+            : Number(row.appliedAmountInLAK || 0);
+        if (row.direction === "OUT") acc.moneyOut += reportAppliedAmount;
+        else acc.moneyIn += reportAppliedAmount;
         if (row.sourceType === "SALE" && row.order && row.order.status !== "CANCELLED") {
           const orderKey = row.order._id?.toString?.() || row.order.orderId || row._id;
           if (!seenSaleOrders.has(orderKey)) {
@@ -322,11 +329,11 @@ router.get("/", async (req: Request, res: Response) => {
             );
             acc.totalOrders += 1;
             acc.totalDebt += row.order.remainingAmount || 0;
-            acc.actualReceivedFromOrders += row.appliedAmountInLAK || 0;
+            acc.actualReceivedFromOrders += reportAppliedAmount;
           }
         }
         if (row.sourceType === "DEBT_REPAYMENT" && row.direction !== "OUT") {
-          acc.debtRepaymentIncome += row.appliedAmountInLAK || 0;
+          acc.debtRepaymentIncome += reportAppliedAmount;
           acc.debtRepaymentCount += 1;
         }
         acc.change += row.changeInLAK || 0;
@@ -352,16 +359,24 @@ router.get("/", async (req: Request, res: Response) => {
     const data = activities.slice((page - 1) * limit, page * limit);
     const grossSales = summary.totalSales + summary.totalDiscount;
     const netProfit = summary.totalSales - summary.totalCost;
+    const totalIncomeToday = summary.actualReceivedFromOrders + summary.debtRepaymentIncome;
+    const netCashReceived = totalIncomeToday - summary.moneyOut;
 
     const fullSummary = {
       ...summary,
       grossSales,
+      grossBillSales: grossSales,
       netSales: summary.totalSales,
+      netBillSales: summary.totalSales,
+      discountAmount: summary.totalDiscount,
       netProfit,
       // Compatibility alias for report consumers that still read totalProfit.
       totalProfit: netProfit,
-      totalIncomeToday: summary.actualReceivedFromOrders + summary.debtRepaymentIncome,
-      net: summary.moneyIn - summary.moneyOut,
+      cashInFromNewBills: summary.actualReceivedFromOrders,
+      totalIncomeToday,
+      netCashReceived,
+      netCashFlow: netCashReceived,
+      net: netCashReceived,
     };
     const managerRequest = isManagerRequest(authReq);
 
