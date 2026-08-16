@@ -821,6 +821,34 @@ router.post("/:id/add-payment-legacy-disabled", async (req: Request, res: Respon
     }
 });
 
+// Get one order for bill detail views.
+router.get("/:id", async (req: Request, res: Response) => {
+    try {
+        const authReq = req as AuthRequest;
+        const { id } = req.params;
+        const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
+        const identityQuery = mongoose.Types.ObjectId.isValid(id)
+            ? { $or: [{ _id: new mongoose.Types.ObjectId(id) }, { orderId: id }] }
+            : { orderId: id };
+
+        const order = await Order.findOne({
+            tenantId: authReq.user!.tenantId,
+            ...identityQuery,
+            ...(scopedCashierId ? { cashierId: scopedCashierId } : {}),
+        })
+            .select("-items.cost")
+            .populate("customerId", "name phone address")
+            .populate("cashierId", "name username phone employeeCode")
+            .populate("cancelledBy", "name username");
+
+        if (!order) return res.status(404).json({ error: "Order not found" });
+        return res.json(order);
+    } catch (error) {
+        console.error("Get order detail failed:", error);
+        return res.status(500).json({ error: "Failed to retrieve order" });
+    }
+});
+
 // Get Payment History for Order
 router.get("/:id/payments", async (req: Request, res: Response) => {
     try {
