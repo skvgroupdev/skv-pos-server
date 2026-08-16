@@ -3,6 +3,7 @@ import { AuthRequest, authMiddleware, requireRoles } from "../middleware/authMid
 import DebtTransaction from "../models/DebtTransaction";
 import Order from "../models/Order";
 import PaymentTransaction from "../models/PaymentTransaction";
+import { debtRepaymentMatch } from "../utils/debtReporting";
 
 const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
@@ -185,8 +186,7 @@ router.get("/", async (req: Request, res: Response) => {
     if (sourceType === "ALL" || sourceType === "DEBT_REPAYMENT") {
       const debtFilter: any = {
         tenantId: authReq.user!.tenantId,
-        type: "DEBIT",
-        paymentMethod: { $ne: "ADJUSTMENT" },
+        ...debtRepaymentMatch(),
       };
       if (Object.keys(dateFilter).length) debtFilter.createdAt = dateFilter;
       if (cashierId) debtFilter.processedBy = cashierId;

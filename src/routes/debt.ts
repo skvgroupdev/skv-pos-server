@@ -6,6 +6,7 @@ import DebtTransaction from "../models/DebtTransaction";
 import mongoose from "mongoose";
 import { createLedgerEntry, normalizePaymentLines, PaymentLineInput } from "../services/PaymentLedgerService";
 import PaymentTransaction from "../models/PaymentTransaction";
+import { debtRepaymentMatch } from "../utils/debtReporting";
 
 const router = express.Router();
 
@@ -355,12 +356,13 @@ router.get("/order-history/:orderId", async (req: Request, res: Response) => {
 router.get("/transactions", async (req: Request, res: Response) => {
     try {
         const authReq = req as AuthRequest;
-        const { startDate, endDate, cashierId, paymentMethod } = req.query;
+        const { startDate, endDate, cashierId, paymentMethod, saleMode } = req.query;
         const scopedCashierId = getScopedCashierId(authReq, cashierId);
         const page = Math.max(1, Number(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+        const tenantId = new mongoose.Types.ObjectId(authReq.user!.tenantId);
 
-        const filter: any = { tenantId: authReq.user!.tenantId, type: "DEBIT" };
+        const filter: any = { tenantId, ...debtRepaymentMatch() };
 
         if (startDate || endDate) {
             filter.createdAt = {};
@@ -368,10 +370,19 @@ router.get("/transactions", async (req: Request, res: Response) => {
             if (endDate) filter.createdAt.$lte = new Date(endDate as string);
         }
 
-        if (scopedCashierId) filter.processedBy = scopedCashierId;
-        if (paymentMethod) filter.paymentMethod = paymentMethod;
+        if (scopedCashierId) filter.processedBy = new mongoose.Types.ObjectId(scopedCashierId);
+        if (["CASH", "TRANSFER", "MIXED", "ADJUSTMENT"].includes(String(paymentMethod))) {
+            filter.paymentMethod = paymentMethod;
+        }
+        if (saleMode === "retail" || saleMode === "wholesale") {
+            const orderIds = await Order.find({
+                tenantId,
+                saleMode: saleMode === "retail" ? { $in: ["retail", null] } : "wholesale",
+            }).distinct("_id");
+            filter.order = { $in: orderIds };
+        }
 
-        const [transactions, transactionCount] = await Promise.all([
+        const [transactions, transactionCount, total, byMethod, byCashier] = await Promise.all([
           DebtTransaction.find(filter)
             .sort({ createdAt: -1 })
             .skip((page - 1) * limit)
@@ -380,10 +391,7 @@ router.get("/transactions", async (req: Request, res: Response) => {
             .populate('order', 'orderId total saleMode')
             .populate('processedBy', 'username roles'),
           DebtTransaction.countDocuments(filter),
-        ]);
-
-        // Analytics
-        const total = await DebtTransaction.aggregate([
+          DebtTransaction.aggregate([
             { $match: filter },
             {
                 $group: {
@@ -392,9 +400,8 @@ router.get("/transactions", async (req: Request, res: Response) => {
                     count: { $sum: 1 }
                 }
             }
-        ]);
-
-        const byMethod = await DebtTransaction.aggregate([
+          ]),
+          DebtTransaction.aggregate([
             { $match: filter },
             {
                 $group: {
@@ -403,9 +410,8 @@ router.get("/transactions", async (req: Request, res: Response) => {
                     count: { $sum: 1 }
                 }
             }
-        ]);
-
-        const byCashier = await DebtTransaction.aggregate([
+          ]),
+          DebtTransaction.aggregate([
             { $match: filter },
             {
                 $group: {
@@ -423,6 +429,7 @@ router.get("/transactions", async (req: Request, res: Response) => {
                 }
             },
             { $unwind: { path: "$cashier", preserveNullAndEmptyArrays: true } }
+          ]),
         ]);
 
         res.json({
@@ -449,9 +456,9 @@ router.get("/cashier-summary", async (req: Request, res: Response) => {
         const { startDate, endDate } = req.query;
 
         const filter: any = {
-            tenantId: authReq.user!.tenantId,
-            processedBy: authReq.user!.userId,
-            type: "DEBIT"
+            tenantId: new mongoose.Types.ObjectId(authReq.user!.tenantId),
+            processedBy: new mongoose.Types.ObjectId(authReq.user!.userId),
+            ...debtRepaymentMatch(),
         };
 
         if (startDate || endDate) {

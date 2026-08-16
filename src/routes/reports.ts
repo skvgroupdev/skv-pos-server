@@ -6,6 +6,8 @@ import DebtTransaction from "../models/DebtTransaction";
 import PaymentTransaction from "../models/PaymentTransaction";
 import OrderReturn from "../models/OrderReturn";
 import mongoose from "mongoose";
+import { debtRepaymentMatch, receivedTransactionStatusMatch } from "../utils/debtReporting";
+import { combineReturnReportSummaries } from "../utils/returnReporting";
 
 const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
@@ -131,7 +133,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             {
                 $match: {
                     tenantId: new mongoose.Types.ObjectId(authReqForDebt.user!.tenantId),
-                    type: "DEBIT",
+                    ...debtRepaymentMatch(),
                     createdAt: { $gte: debtStart, $lte: debtEnd },
                     ...scopedTransactionFilter
                 }
@@ -153,7 +155,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 $match: {
                     tenantId,
                     direction: "IN",
-                    status: "POSTED",
+                    status: receivedTransactionStatusMatch(),
                     sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
                     createdAt: { $gte: debtStart, $lte: debtEnd },
                     ...scopedTransactionFilter
@@ -236,7 +238,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             {
                 $match: {
                     tenantId,
-                    type: "DEBIT",
+                    ...debtRepaymentMatch(),
                     createdAt: { $gte: debtStart, $lte: debtEnd },
                     ...scopedTransactionFilter
                 }
@@ -358,6 +360,63 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                             ]
                         }
                     }
+                }
+            },
+            { $project: { count: { $size: "$returnCount" }, units: 1, value: 1, damagedCost: 1 } }
+        ];
+        const cancelledOrderReturnPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    status: "CANCELLED",
+                    ...(scopedOrderIds ? { _id: { $in: scopedOrderIds } } : {}),
+                    $or: [
+                        { cancelledAt: { $gte: debtStart, $lte: debtEnd } },
+                        { cancelledAt: { $exists: false }, updatedAt: { $gte: debtStart, $lte: debtEnd } }
+                    ]
+                }
+            },
+            { $unwind: "$items" },
+            {
+                $lookup: {
+                    from: "inventorytransactions",
+                    let: { tenantId: "$tenantId", orderId: "$orderId", productId: "$items.product" },
+                    pipeline: [
+                        {
+                            $match: {
+                                type: "VOID_RETURN",
+                                $expr: {
+                                    $and: [
+                                        { $eq: ["$tenantId", "$$tenantId"] },
+                                        { $eq: ["$referenceDoc", "$$orderId"] },
+                                        { $eq: ["$productId", "$$productId"] }
+                                    ]
+                                }
+                            }
+                        },
+                        { $group: { _id: null, quantity: { $sum: "$quantity" } } }
+                    ],
+                    as: "stockReturns"
+                }
+            },
+            {
+                $set: {
+                    restoredQuantity: {
+                        $min: [
+                            "$items.quantity",
+                            { $ifNull: [{ $arrayElemAt: ["$stockReturns.quantity", 0] }, 0] }
+                        ]
+                    }
+                }
+            },
+            { $match: { restoredQuantity: { $gt: 0 } } },
+            {
+                $group: {
+                    _id: null,
+                    returnCount: { $addToSet: "$_id" },
+                    units: { $sum: "$restoredQuantity" },
+                    value: { $sum: { $multiply: ["$items.price", "$restoredQuantity"] } },
+                    damagedCost: { $sum: 0 }
                 }
             },
             { $project: { count: { $size: "$returnCount" }, units: 1, value: 1, damagedCost: 1 } }
@@ -503,6 +562,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             debtRepaymentResult,
             cancellationResult,
             returnResult,
+            cancelledOrderReturnResult,
             moneyOutResult,
             saleIncomeResult,
             legacySaleIncomeResult,
@@ -518,6 +578,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             DebtTransaction.aggregate(debtRepaymentPipeline as any),
             Order.aggregate(cancellationPipeline as any),
             OrderReturn.aggregate(returnPipeline as any),
+            Order.aggregate(cancelledOrderReturnPipeline as any),
             PaymentTransaction.aggregate(moneyOutPipeline as any),
             PaymentTransaction.aggregate(saleIncomePipeline as any),
             Order.aggregate(legacySaleIncomePipeline as any),
@@ -649,7 +710,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         }));
 
         const cancelledOrders = cancellationResult[0] || { count: 0, amount: 0 };
-        const returns = returnResult[0] || { count: 0, units: 0, value: 0, damagedCost: 0 };
+        const returns = combineReturnReportSummaries(returnResult[0], cancelledOrderReturnResult[0]);
         const cashierReceivedByMethod = breakdownByMethod
             .filter((breakdown) => breakdown.method === "CASH" || breakdown.method === "TRANSFER")
             .map((breakdown) => ({

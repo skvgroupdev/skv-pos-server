@@ -984,6 +984,7 @@ router.post("/:id/cancel", requireRoles(["SHOP_ADMIN"]), async (req: Request, re
                     balanceAfter: nextDebt,
                     processedBy: authReq.user!.userId,
                     paymentMethod: "ADJUSTMENT",
+                    reference: `CANCEL:${order.orderId}`,
                     note: `ຍົກເລີກ #${order.orderId}: ${cancelReason.trim()}`,
                 }], { session });
                 customer.totalDebt = nextDebt;
