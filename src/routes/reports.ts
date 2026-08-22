@@ -21,6 +21,31 @@ const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) 
 const isManagerRequest = (authReq: AuthRequest) =>
     authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
 
+const withoutProfitFields = (summary: any) => {
+    const safeSummary = { ...summary };
+    [
+        "totalCost",
+        "billProfit",
+        "netProfit",
+        "cashRecognizedProfit",
+        "reversalProfitImpact",
+        "returnProfitImpact",
+        "adjustmentProfitImpact",
+        "netCashProfit",
+        "netProfitAfterAdjustments",
+        "totalProfit",
+        "profitByCategory",
+    ].forEach((field) => delete safeSummary[field]);
+    safeSummary.breakdownBySaleMode = (safeSummary.breakdownBySaleMode || []).map((row: any) => {
+        const safeRow = { ...row };
+        delete safeRow.totalCost;
+        delete safeRow.netProfit;
+        delete safeRow.totalProfit;
+        return safeRow;
+    });
+    return safeSummary;
+};
+
 // Helper: Parse Date Range
 const getDateRange = (req: Request) => {
     const { startDate, endDate } = req.query;
@@ -1053,45 +1078,7 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
 
         const cancelledOrders = cancellationResult[0] || { count: 0, amount: 0 };
         const returns = combineReturnReportSummaries(returnResult[0], cancelledOrderReturnResult[0]);
-        const cashierReceivedByMethod = breakdownByMethod
-            .filter((breakdown) => breakdown.method === "CASH" || breakdown.method === "TRANSFER")
-            .map((breakdown) => ({
-                method: breakdown.method,
-                totalReceived: breakdown.totalPaid,
-                transactionCount: breakdown.totalOrders,
-            }));
-
-        if (!isManagerRequest(authReq)) {
-            return res.json({
-                totalSales: stats.totalSales,
-                totalOrders: stats.totalOrders,
-                totalDiscount: stats.totalDiscount,
-                avgOrderValue: stats.avgOrderValue,
-                breakdownBySaleMode: breakdownBySaleMode.map((breakdown) => ({
-                    mode: breakdown.mode,
-                    totalSales: breakdown.totalSales,
-                    totalOrders: breakdown.totalOrders,
-                    totalDiscount: breakdown.totalDiscount,
-                    avgOrderValue: breakdown.avgOrderValue,
-                })),
-                receivedByMethod: cashierReceivedByMethod,
-                breakdownByMethod: breakdownByMethod.map((breakdown) => ({
-                    method: breakdown.method,
-                    totalSales: breakdown.totalSales,
-                    totalPaid: breakdown.totalPaid,
-                    totalOrders: breakdown.totalOrders,
-                    totalDebt: breakdown.totalDebt,
-                    totalDiscount: breakdown.totalDiscount,
-                    totalChange: breakdown.totalChange,
-                    netRevenue: breakdown.netRevenue,
-                })),
-                hourlyBreakdown,
-                cancelledOrders: { count: cancelledOrders.count || 0 },
-                returns: { count: returns.count || 0, units: returns.units || 0 },
-            });
-        }
-
-        return res.json({
+        const responseSummary = {
             ...stats,
             grossSales,
             grossBillSales: grossSales,
@@ -1129,7 +1116,8 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             netCashFlow: netCashReceived,
             cancelledOrders,
             returns
-        });
+        };
+        return res.json(isManagerRequest(authReq) ? responseSummary : withoutProfitFields(responseSummary));
     } catch (error) {
         console.error("Report Summary Error:", error);
         res.status(500).json({ error: "Failed to fetch summary" });

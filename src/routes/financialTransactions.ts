@@ -34,6 +34,12 @@ const withoutCostFields = (activity: any) => {
   return { ...safeActivity, order };
 };
 
+const withoutProfitSummaryFields = (summary: any) => {
+  const safeSummary = { ...summary };
+  ["totalCost", "netProfit", "totalProfit"].forEach((field) => delete safeSummary[field]);
+  return safeSummary;
+};
+
 const orderDetailFields = [
   "orderId",
   "total",
@@ -385,14 +391,7 @@ router.get("/", async (req: Request, res: Response) => {
       total,
       page,
       totalPages: Math.max(1, Math.ceil(total / limit)),
-      summary: managerRequest
-        ? fullSummary
-        : {
-            totalSales: summary.totalSales,
-            totalOrders: summary.totalOrders,
-            totalDiscount: summary.totalDiscount,
-            avgOrderValue: summary.totalSales / (summary.totalOrders || 1),
-          },
+      summary: managerRequest ? fullSummary : withoutProfitSummaryFields(fullSummary),
     });
   } catch (error) {
     console.error("Financial transactions failed:", error);
