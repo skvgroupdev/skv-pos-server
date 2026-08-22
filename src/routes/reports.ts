@@ -147,16 +147,15 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             }
         ];
 
-        // Actual receipts grouped by the way money entered the shop. Unlike an
-        // order's paymentMethod, payment lines correctly classify a deposit on a
-        // DEBT order as CASH/TRANSFER and also include later debt repayments.
+        // Net sales received by the original payment method. If a transfer bill
+        // is cancelled but the shop refunds cash, this still subtracts TRANSFER
+        // so the payment-method sales mix reflects the bill that was reversed.
         const receivedByMethodPipeline = [
             {
                 $match: {
                     tenantId,
-                    direction: "IN",
                     status: receivedTransactionStatusMatch(),
-                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
+                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT", "REFUND", "REVERSAL"] },
                     createdAt: { $gte: debtStart, $lte: debtEnd },
                     ...scopedTransactionFilter
                 }
@@ -171,10 +170,43 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             },
             { $unwind: { path: "$orderInfo", preserveNullAndEmptyArrays: true } },
             {
+                $lookup: {
+                    from: "paymenttransactions",
+                    let: { orderId: "$order", tenantId: "$tenantId" },
+                    pipeline: [
+                        {
+                            $match: {
+                                direction: "IN",
+                                sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
+                                status: receivedTransactionStatusMatch(),
+                                $expr: {
+                                    $and: [
+                                        { $eq: ["$order", "$$orderId"] },
+                                        { $eq: ["$tenantId", "$$tenantId"] }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $set: {
+                                appliedRatio: {
+                                    $cond: [
+                                        { $gt: ["$grossReceivedInLAK", 0] },
+                                        { $divide: ["$appliedAmountInLAK", "$grossReceivedInLAK"] },
+                                        0
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    as: "incomingLedgers"
+                }
+            },
+            {
                 $set: {
                     reportAppliedAmountInLAK: {
                         $cond: [
-                            { $and: [{ $eq: ["$sourceType", "SALE"] }, { $eq: ["$orderInfo.paymentMethod", "DEBT"] }] },
+                            { $and: [{ $eq: ["$sourceType", "SALE"] }, { $eq: ["$direction", "IN"] }, { $eq: ["$orderInfo.paymentMethod", "DEBT"] }] },
                             {
                                 $max: [
                                     0,
@@ -188,6 +220,62 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                             },
                             "$appliedAmountInLAK"
                         ]
+                    },
+                    originalMethodLines: {
+                        $reduce: {
+                            input: "$incomingLedgers",
+                            initialValue: [],
+                            in: {
+                                $concatArrays: [
+                                    "$$value",
+                                    {
+                                        $map: {
+                                            input: { $ifNull: ["$$this.payments", []] },
+                                            as: "payment",
+                                            in: {
+                                                method: "$$payment.method",
+                                                amountInLAK: {
+                                                    $multiply: [
+                                                        { $ifNull: ["$$payment.amountInLAK", 0] },
+                                                        { $ifNull: ["$$this.appliedRatio", 0] }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                $set: {
+                    methodLines: {
+                        $cond: [
+                            { $eq: ["$direction", "OUT"] },
+                            {
+                                $cond: [
+                                    { $gt: [{ $size: "$originalMethodLines" }, 0] },
+                                    "$originalMethodLines",
+                                    "$payments"
+                                ]
+                            },
+                            "$payments"
+                        ]
+                    }
+                }
+            },
+            {
+                $set: {
+                    methodLineTotalInLAK: {
+                        $sum: {
+                            $map: {
+                                input: "$methodLines",
+                                as: "line",
+                                in: { $ifNull: ["$$line.amountInLAK", 0] }
+                            }
+                        }
                     }
                 }
             },
@@ -195,11 +283,45 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 $set: {
                     appliedRatio: {
                         $cond: [
-                            { $gt: ["$grossReceivedInLAK", 0] },
-                            { $divide: ["$reportAppliedAmountInLAK", "$grossReceivedInLAK"] },
+                            { $gt: ["$methodLineTotalInLAK", 0] },
+                            { $divide: ["$reportAppliedAmountInLAK", "$methodLineTotalInLAK"] },
                             0
                         ]
                     }
+                }
+            },
+            { $unwind: "$methodLines" },
+            {
+                $group: {
+                    _id: "$methodLines.method",
+                    totalReceived: {
+                        $sum: {
+                            $cond: [
+                                { $eq: ["$direction", "OUT"] },
+                                { $multiply: ["$methodLines.amountInLAK", "$appliedRatio", -1] },
+                                { $multiply: ["$methodLines.amountInLAK", "$appliedRatio"] }
+                            ]
+                        }
+                    },
+                    transactionIds: { $addToSet: "$_id" }
+                }
+            },
+            {
+                $project: {
+                    _id: 1,
+                    totalReceived: { $round: ["$totalReceived", 0] },
+                    transactionCount: { $size: "$transactionIds" }
+                }
+            }
+        ];
+        const cashMovementByMethodPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    status: receivedTransactionStatusMatch(),
+                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT", "REFUND", "REVERSAL"] },
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...scopedTransactionFilter
                 }
             },
             { $unwind: "$payments" },
@@ -207,7 +329,13 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 $group: {
                     _id: "$payments.method",
                     totalReceived: {
-                        $sum: { $multiply: ["$payments.amountInLAK", "$appliedRatio"] }
+                        $sum: {
+                            $cond: [
+                                { $eq: ["$direction", "OUT"] },
+                                { $multiply: ["$payments.amountInLAK", -1] },
+                                "$payments.amountInLAK"
+                            ]
+                        }
                     },
                     transactionIds: { $addToSet: "$_id" }
                 }
@@ -221,47 +349,56 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             }
         ];
 
-        // Currency received at checkout. Repayments are merged below so the
-        // currency card follows cash received date rather than original sale date.
-        const receivedPipeline = [
-            { $match: match },
-            { $unwind: "$payments" },
-            {
-                $group: {
-                    _id: "$payments.currency",
-                    amount: { $sum: "$payments.amount" },
-                    amountInLAK: { $sum: "$payments.amountInLAK" }
-                }
-            }
-        ];
-        const debtReceivedPipeline = [
+        // Net physical currency movement in the selected period. This follows
+        // cash movement date and subtracts refunds/reversals from the currency
+        // that was actually handed back to the customer.
+        const netReceivedByCurrencyPipeline = [
             {
                 $match: {
                     tenantId,
-                    ...debtRepaymentMatch(),
+                    status: receivedTransactionStatusMatch(),
+                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT", "REFUND", "REVERSAL"] },
                     createdAt: { $gte: debtStart, $lte: debtEnd },
                     ...scopedTransactionFilter
                 }
             },
-            {
-                $set: {
-                    normalizedPayments: {
-                        $cond: [
-                            { $gt: [{ $size: { $ifNull: ["$paymentBreakdown", []] } }, 0] },
-                            "$paymentBreakdown",
-                            [{ currency: "LAK", amount: "$amount", amountInLAK: "$amount" }]
-                        ]
-                    }
-                }
-            },
-            { $unwind: "$normalizedPayments" },
+            { $unwind: "$payments" },
             {
                 $group: {
-                    _id: "$normalizedPayments.currency",
-                    amount: { $sum: "$normalizedPayments.amount" },
-                    amountInLAK: { $sum: "$normalizedPayments.amountInLAK" }
+                    _id: "$payments.currency",
+                    amount: {
+                        $sum: {
+                            $cond: [
+                                { $eq: ["$direction", "OUT"] },
+                                { $multiply: ["$payments.amount", -1] },
+                                "$payments.amount"
+                            ]
+                        }
+                    },
+                    amountInLAK: {
+                        $sum: {
+                            $cond: [
+                                { $eq: ["$direction", "OUT"] },
+                                { $multiply: ["$payments.amountInLAK", -1] },
+                                "$payments.amountInLAK"
+                            ]
+                        }
+                    }
                 }
             }
+        ];
+        const ledgerChangePipeline = [
+            {
+                $match: {
+                    tenantId,
+                    direction: "IN",
+                    status: receivedTransactionStatusMatch(),
+                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...scopedTransactionFilter
+                }
+            },
+            { $group: { _id: null, amount: { $sum: "$changeInLAK" } } }
         ];
 
         // Profit (Cost calculation) & Categorical breakdown
@@ -487,6 +624,150 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 }
             }
         ];
+        const cashRecognizedProfitPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    sourceType: { $in: ["SALE", "DEBT_REPAYMENT"] },
+                    direction: "IN",
+                    status: receivedTransactionStatusMatch(),
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...scopedTransactionFilter
+                }
+            },
+            {
+                $lookup: {
+                    from: "orders",
+                    localField: "order",
+                    foreignField: "_id",
+                    as: "orderInfo"
+                }
+            },
+            { $unwind: "$orderInfo" },
+            {
+                $set: {
+                    orderCost: {
+                        $sum: {
+                            $map: {
+                                input: { $ifNull: ["$orderInfo.items", []] },
+                                as: "item",
+                                in: { $multiply: [{ $ifNull: ["$$item.cost", 0] }, { $ifNull: ["$$item.quantity", 0] }] }
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                $set: {
+                    orderProfit: { $subtract: [{ $ifNull: ["$orderInfo.total", 0] }, "$orderCost"] },
+                    cappedAppliedAmount: {
+                        $min: [
+                            { $ifNull: ["$appliedAmountInLAK", 0] },
+                            { $ifNull: ["$orderInfo.total", 0] }
+                        ]
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    amount: {
+                        $sum: {
+                            $cond: [
+                                { $gt: ["$orderInfo.total", 0] },
+                                { $multiply: ["$orderProfit", { $divide: ["$cappedAppliedAmount", "$orderInfo.total"] }] },
+                                0
+                            ]
+                        }
+                    }
+                }
+            }
+        ];
+        const reversalProfitImpactPipeline = [
+            {
+                $match: {
+                    tenantId,
+                    sourceType: "REVERSAL",
+                    direction: "OUT",
+                    status: "POSTED",
+                    createdAt: { $gte: debtStart, $lte: debtEnd },
+                    ...scopedTransactionFilter
+                }
+            },
+            {
+                $lookup: {
+                    from: "orders",
+                    localField: "order",
+                    foreignField: "_id",
+                    as: "orderInfo"
+                }
+            },
+            { $unwind: "$orderInfo" },
+            {
+                $set: {
+                    orderCost: {
+                        $sum: {
+                            $map: {
+                                input: { $ifNull: ["$orderInfo.items", []] },
+                                as: "item",
+                                in: { $multiply: [{ $ifNull: ["$$item.cost", 0] }, { $ifNull: ["$$item.quantity", 0] }] }
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                $set: {
+                    orderProfit: { $subtract: [{ $ifNull: ["$orderInfo.total", 0] }, "$orderCost"] },
+                    cappedAppliedAmount: {
+                        $min: [
+                            { $ifNull: ["$appliedAmountInLAK", 0] },
+                            { $ifNull: ["$orderInfo.total", 0] }
+                        ]
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    amount: {
+                        $sum: {
+                            $cond: [
+                                { $gt: ["$orderInfo.total", 0] },
+                                { $multiply: ["$orderProfit", { $divide: ["$cappedAppliedAmount", "$orderInfo.total"] }] },
+                                0
+                            ]
+                        }
+                    }
+                }
+            }
+        ];
+        const returnProfitImpactPipeline = [
+            { $match: { tenantId, createdAt: { $gte: debtStart, $lte: debtEnd }, ...(scopedOrderIds ? { order: { $in: scopedOrderIds } } : {}) } },
+            { $unwind: "$items" },
+            {
+                $group: {
+                    _id: null,
+                    returnedMargin: {
+                        $sum: {
+                            $multiply: [
+                                { $subtract: ["$items.price", "$items.cost"] },
+                                "$items.quantity"
+                            ]
+                        }
+                    },
+                    damagedCost: {
+                        $sum: {
+                            $cond: [
+                                { $in: ["$items.condition", ["DAMAGED", "DEFECTIVE", "INCOMPLETE"]] },
+                                { $multiply: ["$items.cost", "$items.quantity"] },
+                                0
+                            ]
+                        }
+                    }
+                }
+            }
+        ];
         const legacySaleIncomePipeline = [
             { $match: cashflowOrderMatch },
             {
@@ -548,14 +829,55 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
                 }
             },
             { $match: { "reversalLedger.0": { $exists: false } } },
-            { $group: { _id: null, amount: { $sum: initialOrderReceiptExpression }, count: { $sum: 1 } } }
+            {
+                $set: {
+                    orderCost: {
+                        $sum: {
+                            $map: {
+                                input: { $ifNull: ["$items", []] },
+                                as: "item",
+                                in: { $multiply: [{ $ifNull: ["$$item.cost", 0] }, { $ifNull: ["$$item.quantity", 0] }] }
+                            }
+                        }
+                    },
+                    appliedPaid: initialOrderReceiptExpression
+                }
+            },
+            {
+                $set: {
+                    orderProfit: { $subtract: [{ $ifNull: ["$total", 0] }, "$orderCost"] },
+                    cappedAppliedAmount: {
+                        $min: [
+                            "$appliedPaid",
+                            { $ifNull: ["$total", 0] }
+                        ]
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: null,
+                    amount: { $sum: "$appliedPaid" },
+                    count: { $sum: 1 },
+                    profitImpact: {
+                        $sum: {
+                            $cond: [
+                                { $gt: ["$total", 0] },
+                                { $multiply: ["$orderProfit", { $divide: ["$cappedAppliedAmount", "$total"] }] },
+                                0
+                            ]
+                        }
+                    }
+                }
+            }
         ];
 
         const [
             statsResult,
-            receivedResult,
-            debtReceivedResult,
+            netReceivedByCurrencyResult,
+            ledgerChangeResult,
             receivedByMethodResult,
+            cashMovementByMethodResult,
             itemsResult,
             saleModeResult,
             hourlyResult,
@@ -567,11 +889,15 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             saleIncomeResult,
             legacySaleIncomeResult,
             legacyCancellationResult,
+            cashRecognizedProfitResult,
+            reversalProfitImpactResult,
+            returnProfitImpactResult,
         ] = await Promise.all([
             Order.aggregate(statsPipeline),
-            Order.aggregate(receivedPipeline),
-            DebtTransaction.aggregate(debtReceivedPipeline as any),
+            PaymentTransaction.aggregate(netReceivedByCurrencyPipeline as any),
+            PaymentTransaction.aggregate(ledgerChangePipeline as any),
             PaymentTransaction.aggregate(receivedByMethodPipeline as any),
+            PaymentTransaction.aggregate(cashMovementByMethodPipeline as any),
             Order.aggregate(itemsPipeline),
             Order.aggregate(saleModePipeline as any),
             Order.aggregate(hourlyPipeline as any),
@@ -583,6 +909,9 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             PaymentTransaction.aggregate(saleIncomePipeline as any),
             Order.aggregate(legacySaleIncomePipeline as any),
             Order.aggregate(legacyCancellationPipeline as any),
+            PaymentTransaction.aggregate(cashRecognizedProfitPipeline as any),
+            PaymentTransaction.aggregate(reversalProfitImpactPipeline as any),
+            OrderReturn.aggregate(returnProfitImpactPipeline as any),
         ]);
 
         // Process statsResult which is now grouped by paymentMethod
@@ -601,6 +930,11 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             totalReceived: row.totalReceived,
             transactionCount: row.transactionCount
         }));
+        const cashMovementByMethod = cashMovementByMethodResult.map((row: any) => ({
+            method: row._id,
+            totalReceived: row.totalReceived,
+            transactionCount: row.transactionCount
+        }));
 
         const debtRepaymentIncome = debtRepaymentResult[0]?.totalRepaid || 0;
         const debtRepaymentCount  = debtRepaymentResult[0]?.count || 0;
@@ -608,7 +942,8 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         // Sales reporting contract:
         // grossSales/grossBillSales = bill value before the order-level discount.
         // totalSales/netBillSales = bill value after discount (Order.total), before refunds.
-        // cashInFromNewBills = only money actually handed over at time of sale.
+        // actualReceivedFromOrders = gross money handed over at time of sale.
+        // cashInFromNewBills = sale cash after same-period bill reversals.
         // debtRepaymentIncome = repayments by repayment date, not original order date.
         // netCashReceived = cash in from new bills + debt repayments - refunds/reversals.
         // `totalProfit` remains as a compatibility alias for existing clients.
@@ -635,13 +970,14 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             .reduce((sum: number, row: any) => sum + row.amount, 0);
         const reversals = reversalsFromLedger + (legacyCancellationResult[0]?.amount || 0);
         const moneyOut = refunds + reversals;
-        const cashInFromNewBills = actualReceivedFromOrders;
+        const cashInFromNewBills = actualReceivedFromOrders - reversals;
         const netCashReceived = totalIncomeToday - moneyOut;
 
-        // Adjust received breakdown: subtract change from LAK
-        const totalChange = stats.totalChange;
+        // Adjust received breakdown: subtract change from LAK. Payment ledger
+        // lines store gross received cash, while change is handed back in LAK.
+        const totalChange = ledgerChangeResult[0]?.amount || 0;
         const receivedByCurrency = new Map<string, { currency: string; amount: number; amountInLAK: number }>();
-        [...receivedResult, ...debtReceivedResult].forEach((row: any) => {
+        netReceivedByCurrencyResult.forEach((row: any) => {
             const currency = row._id || "LAK";
             const current = receivedByCurrency.get(currency) || { currency, amount: 0, amountInLAK: 0 };
             current.amount += row.amount || 0;
@@ -672,8 +1008,14 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
         const netBillSales = stats.totalSales;
         const netSalesAfterAdjustments = Math.max(0, netBillSales - moneyOut);
         const totalCost = itemsResult[0]?.totalCost || 0;
-        const netProfit = stats.totalSales - totalCost;
-        const netProfitAfterAdjustments = netProfit - moneyOut;
+        const billProfit = stats.totalSales - totalCost;
+        const netProfit = billProfit;
+        const cashRecognizedProfit = cashRecognizedProfitResult[0]?.amount || 0;
+        const reversalProfitImpact = (reversalProfitImpactResult[0]?.amount || 0) + (legacyCancellationResult[0]?.profitImpact || 0);
+        const returnProfitImpact = (returnProfitImpactResult[0]?.returnedMargin || 0) + (returnProfitImpactResult[0]?.damagedCost || 0);
+        const adjustmentProfitImpact = reversalProfitImpact + returnProfitImpact;
+        const netCashProfit = cashRecognizedProfit - adjustmentProfitImpact;
+        const netProfitAfterAdjustments = netCashProfit;
 
         // Calculate Profit by Category
         const categoryMap: any = {};
@@ -758,11 +1100,18 @@ router.get("/summary", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Requ
             netSalesAfterAdjustments,
             discountAmount: stats.totalDiscount,
             totalCost,
+            billProfit,
             netProfit,
+            cashRecognizedProfit,
+            reversalProfitImpact,
+            returnProfitImpact,
+            adjustmentProfitImpact,
+            netCashProfit,
             netProfitAfterAdjustments,
-            totalProfit: netProfit,
+            totalProfit: netCashProfit,
             receivedBreakdown,
             receivedByMethod,
+            cashMovementByMethod,
             profitByCategory,
             breakdownByMethod,
             breakdownBySaleMode,

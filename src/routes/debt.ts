@@ -110,6 +110,31 @@ const generateReceiptNumber = () => {
     return `RPT${timestamp}${random}`;
 };
 
+const proratePaymentLines = (paymentLines: PaymentLineInput[], allocationAmount: number, totalAmount: number) => {
+    if (paymentLines.length === 0 || totalAmount <= 0) return paymentLines;
+    if (Math.abs(allocationAmount - totalAmount) <= 1) return paymentLines;
+
+    let allocatedInLAK = 0;
+    return paymentLines.map((line, index) => {
+        const isLast = index === paymentLines.length - 1;
+        const amountInLAK = isLast
+            ? Math.max(0, allocationAmount - allocatedInLAK)
+            : Math.round((Number(line.amountInLAK || 0) / totalAmount) * allocationAmount);
+        allocatedInLAK += amountInLAK;
+        const rate = Number(line.rate || 1);
+        const currency = (line.currency || "LAK").toUpperCase();
+        const amount = currency === "LAK" ? amountInLAK : Number((amountInLAK / rate).toFixed(2));
+        return {
+            ...line,
+            currency,
+            amount,
+            amountInLAK,
+        };
+    }).filter((line) => Number(line.amountInLAK || 0) > 0);
+};
+
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 // Repay Debt (Enhanced Professional Version)
 router.post("/repay", async (req: Request, res: Response) => {
     const authReq = req as AuthRequest;
@@ -142,7 +167,10 @@ router.post("/repay", async (req: Request, res: Response) => {
         if (requestKey) {
             const existing = await PaymentTransaction.findOne({
                 tenantId: authReq.user!.tenantId,
-                idempotencyKey: requestKey,
+                $or: [
+                    { idempotencyKey: requestKey },
+                    { idempotencyKey: { $regex: `^${escapeRegex(requestKey)}:` } },
+                ],
             });
             if (existing) {
                 const currentCustomer = await Customer.findOne({
@@ -195,6 +223,7 @@ router.post("/repay", async (req: Request, res: Response) => {
                 const processedBy = authReq.user!.userId;
                 const paidOrders: string[] = [];
                 let linkedOrder: any;
+                const paymentAllocations: Array<{ order: any; amount: number }> = [];
 
                 if (orderId) {
                     linkedOrder = await Order.findOne({
@@ -218,6 +247,7 @@ router.post("/repay", async (req: Request, res: Response) => {
                     if (linkedOrder.remainingAmount <= 0) linkedOrder.remainingAmount = 0;
                     await linkedOrder.save({ session });
                     paidOrders.push(linkedOrder.orderId);
+                    paymentAllocations.push({ order: linkedOrder, amount: repayAmount });
                 } else {
                     const unpaidOrders = await Order.find({
                         customerId,
@@ -237,6 +267,7 @@ router.post("/repay", async (req: Request, res: Response) => {
                         if (order.remainingAmount <= 0) order.remainingAmount = 0;
                         await order.save({ session });
                         paidOrders.push(order.orderId);
+                        paymentAllocations.push({ order, amount: deduction });
                     }
 
                     if (remainingRepay > 0) {
@@ -260,21 +291,26 @@ router.post("/repay", async (req: Request, res: Response) => {
                     note: note || (linkedOrder ? `ຊຳລະບິນ #${linkedOrder.orderId}` : `ຊຳລະລວມ ${paidOrders.length} ບິນ`),
                 }], { session });
 
-                const ledger = await createLedgerEntry({
-                    tenantId: authReq.user!.tenantId,
-                    sourceType: "DEBT_REPAYMENT",
-                    direction: "IN",
-                    orderId: linkedOrder?._id,
-                    customerId: customer._id as any,
-                    processedBy,
-                    paymentMethod,
-                    payments: paymentLines,
-                    appliedAmountInLAK: repayAmount,
-                    note,
-                    idempotencyKey: requestKey,
-                    sourceRecordKey: `DEBT:${debtDocs[0]._id.toString()}`,
-                    session,
-                });
+                const ledgerEntries = [];
+                for (const allocation of paymentAllocations) {
+                    const allocationPayments = proratePaymentLines(paymentLines, allocation.amount, repayAmount);
+                    const ledger = await createLedgerEntry({
+                        tenantId: authReq.user!.tenantId,
+                        sourceType: "DEBT_REPAYMENT",
+                        direction: "IN",
+                        orderId: allocation.order._id,
+                        customerId: customer._id as any,
+                        processedBy,
+                        paymentMethod,
+                        payments: allocationPayments,
+                        appliedAmountInLAK: allocation.amount,
+                        note: note || `ຊຳລະບິນ #${allocation.order.orderId}`,
+                        idempotencyKey: requestKey ? `${requestKey}:${allocation.order._id.toString()}` : undefined,
+                        sourceRecordKey: `DEBT:${debtDocs[0]._id.toString()}:${allocation.order._id.toString()}`,
+                        session,
+                    });
+                    ledgerEntries.push(ledger);
+                }
 
                 customer.totalDebt -= repayAmount;
                 customer.lastPaymentDate = new Date();
@@ -284,7 +320,7 @@ router.post("/repay", async (req: Request, res: Response) => {
                     success: true,
                     newDebt: customer.totalDebt,
                     receiptNumber,
-                    transactionId: ledger.transactionId,
+                    transactionId: ledgerEntries[0]?.transactionId,
                     processedBy,
                 };
             });
