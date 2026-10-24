@@ -41,7 +41,7 @@ router.get(
       Tenant.countDocuments(),
       Tenant.countDocuments({ businessType: "GROCERY" }),
       Tenant.countDocuments({ businessType: "RESTAURANT" }),
-      Tenant.countDocuments({ status: "ACTIVE" }),
+      Tenant.countDocuments({ status: /^ACTIVE$/i }),
     ]);
 
     res.json({

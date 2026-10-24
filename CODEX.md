@@ -33,11 +33,13 @@ Make sure Docker Desktop is running before building or starting the container.
 Useful checks:
 
 ```bash
-curl http://localhost:${PORT:-8000}/health
+curl http://localhost:3002/health
 docker compose ps
 docker compose logs -f skv-pos-server
 docker compose down
 ```
+
+Docker publishes the API on host port `3002` and forwards traffic to the container port configured by `PORT` (currently `8000`). The web app's `VITE_API_BASE_URL` should use `http://localhost:3002/api` when connecting to this Docker instance.
 
 The Docker image does not copy `.env` into the image. `docker-compose.yml` injects the folder's `.env` at runtime via `env_file`.
 Avoid sharing `docker compose config` output because Docker expands `.env` values in that output.
@@ -45,7 +47,7 @@ Avoid sharing `docker compose config` output because Docker expands `.env` value
 The server reads `.env` from the project root even when the command is started from a different working directory. Required variables include:
 
 ```bash
-MONGO_URI
+MONGODB_URI (or MONGO_URI)
 PORT
 JWT_SECRET
 AWS_ACCESS_KEY_ID

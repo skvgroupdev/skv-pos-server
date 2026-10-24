@@ -15,6 +15,9 @@ export interface AuthRequest extends Request {
   user?: AuthUser;
 }
 
+const isTenantActive = (status: string | undefined): boolean =>
+  status?.toUpperCase() === "ACTIVE";
+
 const verifyBearerToken = (req: Request, res: Response): AuthUser | null => {
   const authHeader = req.headers.authorization;
 
@@ -59,7 +62,7 @@ export const tenantAuthMiddleware = async (
     return res.status(403).json({ error: "Tenant not found" });
   }
 
-  if (tenant.status !== "ACTIVE") {
+  if (!isTenantActive(tenant.status)) {
     return res.status(403).json({ error: "Tenant is not active" });
   }
 
@@ -101,7 +104,7 @@ export const requireActiveTenant = async (
     return res.status(403).json({ error: "Tenant not found" });
   }
 
-  if (tenant.status !== "ACTIVE") {
+  if (!isTenantActive(tenant.status)) {
     return res.status(403).json({ error: "Tenant is not active" });
   }
 
