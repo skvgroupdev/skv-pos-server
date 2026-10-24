@@ -16,6 +16,7 @@ export interface ITenant extends Document {
   receiptNote?: string;
 
   status: 'ACTIVE' | 'SUSPENDED' | 'PENDING';
+  businessType: 'GROCERY' | 'RESTAURANT';
   subscriptionPlan: 'BASIC' | 'PRO' | 'ENTERPRISE';
   expireAt: Date;
 
@@ -43,6 +44,12 @@ const TenantSchema: Schema = new Schema(
       type: String,
       enum: ['ACTIVE', 'SUSPENDED', 'PENDING'],
       default: 'ACTIVE'
+    },
+    businessType: {
+      type: String,
+      enum: ['GROCERY', 'RESTAURANT'],
+      default: 'GROCERY',
+      index: true
     },
     subscriptionPlan: {
       type: String,

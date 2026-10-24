@@ -18,6 +18,7 @@ import tenantsRoutes from "./routes/tenants";
 import quotationRoutes from "./routes/quotations";
 import financialTransactionRoutes from "./routes/financialTransactions";
 import returnRoutes from "./routes/returns";
+import platformRoutes from "./routes/platform";
 import { startDatabaseBackupScheduler } from "./jobs/backupScheduler";
 import morgan from "morgan";
 
@@ -35,13 +36,14 @@ app.use(
 );
 app.use(morgan("dev"));
 // 3. Database Connection
-if (!process.env.MONGO_URI) {
-  console.error("Error: MONGO_URI is not defined in .env file");
+const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
+if (!mongoUri) {
+  console.error("Error: MONGODB_URI or MONGO_URI is not defined in .env file");
   process.exit(1);
 }
 
 mongoose
-  .connect(process.env.MONGO_URI)
+  .connect(mongoUri)
   .then(async () => {
     console.log("Connected to MongoDB");
     startDatabaseBackupScheduler();
@@ -68,6 +70,7 @@ app.get("/health", healthHandler);
 
 // 5. Routes
 app.use("/api/auth", authRoutes);
+app.use("/api/platform", platformRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/categories", categoryRoutes);

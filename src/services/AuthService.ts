@@ -54,6 +54,7 @@ export class AuthService {
         userId: user._id,
         tenantId: user.tenantId,
         roles: user.roles,
+        scope: "TENANT",
       },
       process.env.JWT_SECRET || "secret",
       { expiresIn: "23h" }
@@ -116,6 +117,7 @@ export class AuthService {
         userId: newUser._id,
         tenantId: newUser.tenantId,
         roles: newUser.roles,
+        scope: "TENANT",
       },
       process.env.JWT_SECRET || "secret",
       { expiresIn: "23h" }

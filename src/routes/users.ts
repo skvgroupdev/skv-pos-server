@@ -8,8 +8,7 @@ const requireShopAdmin = (req: Request, res: Response, next: NextFunction) => {
   const authReq = req as AuthRequest;
   if (
     !authReq.user ||
-    (!authReq.user.roles.includes("SHOP_ADMIN") &&
-      !authReq.user.roles.includes("SUPER_ADMIN"))
+    !authReq.user.roles.includes("SHOP_ADMIN")
   ) {
     return res
       .status(403)

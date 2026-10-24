@@ -12,7 +12,7 @@ const router = express.Router();
 router.use(authMiddleware as express.RequestHandler);
 
 const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
-  const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+  const isManager = authReq.user!.roles.includes("SHOP_ADMIN");
   return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
 };
 
@@ -25,7 +25,7 @@ router.get("/", requireRoles(["SHOP_ADMIN", "CASHIER"]), async (req: Request, re
     const page = Math.max(1, Number(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
     const scopedCashierId = getScopedCashierId(authReq, req.query.cashierId);
-    const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+    const isManager = authReq.user!.roles.includes("SHOP_ADMIN");
     const filter: any = { tenantId: authReq.user!.tenantId };
     if (req.query.orderId) {
       const order = await Order.findOne({

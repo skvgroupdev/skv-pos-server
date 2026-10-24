@@ -10,12 +10,12 @@ router.use(authMiddleware as express.RequestHandler);
 router.use(requireRoles(["SHOP_ADMIN", "CASHIER"]));
 
 const getScopedCashierId = (authReq: AuthRequest, requestedCashierId?: unknown) => {
-  const isManager = authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+  const isManager = authReq.user!.roles.includes("SHOP_ADMIN");
   return isManager ? String(requestedCashierId || "") : authReq.user!.userId;
 };
 
 const isManagerRequest = (authReq: AuthRequest) =>
-  authReq.user!.roles.includes("SHOP_ADMIN") || authReq.user!.roles.includes("SUPER_ADMIN");
+  authReq.user!.roles.includes("SHOP_ADMIN");
 
 const withoutCostFields = (activity: any) => {
   const order = activity.order
