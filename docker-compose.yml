@@ -9,7 +9,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "${PORT:-8000}:${PORT:-8000}"
+      - "3002:${PORT:-8000}"
     restart: unless-stopped
     healthcheck:
       test:
