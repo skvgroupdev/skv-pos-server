@@ -81,7 +81,12 @@ export class ProductService {
       }
       if (filters.stockLevel) {
         if (filters.stockLevel === "low") {
-          query.$expr = { $lte: ["$stock", { $ifNull: ["$minStock", 5] }] };
+          query.$expr = {
+            $and: [
+              { $gt: ["$stock", 0] },
+              { $lt: ["$stock", { $cond: [{ $gt: ["$minStock", 0] }, "$minStock", 2] }] },
+            ],
+          };
         } else if (filters.stockLevel === "out") {
           query.stock = { $lte: 0 };
         }
@@ -118,9 +123,14 @@ export class ProductService {
           break;
       }
     }
+    sortOption._id = -1;
+
+    const summaryQuery = { ...query };
+    if (filters?.stockLevel === "low") delete summaryQuery.$expr;
+    if (filters?.stockLevel === "out") delete summaryQuery.stock;
 
     const summaryPipeline = [
-      { $match: query },
+      { $match: summaryQuery },
       {
         $group: {
           _id: null,
@@ -129,12 +139,18 @@ export class ProductService {
           lowStock: {
             $sum: {
               $cond: [
-                { $lte: [{ $ifNull: ["$stock", 0] }, { $ifNull: ["$minStock", 0] }] },
+                {
+                  $and: [
+                    { $gt: ["$stock", 0] },
+                    { $lt: ["$stock", { $cond: [{ $gt: ["$minStock", 0] }, "$minStock", 2] }] },
+                  ],
+                },
                 1,
                 0,
               ],
             },
           },
+          outOfStock: { $sum: { $cond: [{ $lte: ["$stock", 0] }, 1, 0] } },
           totalValue: {
             $sum: {
               $multiply: [
@@ -173,6 +189,7 @@ export class ProductService {
           totalItems: 1,
           totalProducts: { $round: ["$totalProducts", 0] },
           lowStock: 1,
+          outOfStock: 1,
           totalValue: { $round: ["$totalValue", 0] },
           potentialProfit: { $round: ["$potentialProfit", 0] },
           projectedRevenue: { $round: ["$projectedRevenue", 0] },
@@ -189,6 +206,7 @@ export class ProductService {
       data: products,
       summary: summaryResult[0] || {
         lowStock: 0,
+        outOfStock: 0,
         potentialProfit: 0,
         projectedRevenue: 0,
         totalItems: 0,

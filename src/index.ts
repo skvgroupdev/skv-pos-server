@@ -1,5 +1,6 @@
 import "./config/env";
 import express from "express";
+import { randomUUID } from "node:crypto";
 import mongoose from "mongoose";
 import cors from "cors";
 import authRoutes from "./routes/auth";
@@ -27,6 +28,13 @@ const PORT = process.env.PORT || 5000;
 const jsonLimit = process.env.API_JSON_LIMIT || "1mb";
 
 // 2. Middlewares
+app.use((_req, res, next) => {
+  res.setHeader("X-Request-Id", randomUUID());
+  next();
+});
+morgan.token("request-id", (_req, res) => String(res.getHeader("X-Request-Id")));
+morgan.token("path", (req) => req.url?.split("?")[0]);
+app.use(morgan(":date[iso] request_id=:request-id :method :path :status :response-time ms"));
 app.use(express.json({ limit: jsonLimit }));
 app.use(
   cors({
@@ -34,7 +42,6 @@ app.use(
     credentials: true,
   })
 );
-app.use(morgan("dev"));
 // 3. Database Connection
 const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
 if (!mongoUri) {

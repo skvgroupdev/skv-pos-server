@@ -47,7 +47,7 @@ const ProductSchema: Schema = new Schema(
     wholesalePrice: { type: Number, default: 0 },
     stock: { type: Number, required: true, default: 0 },
     reservedStock: { type: Number, required: true, default: 0, min: 0 },
-    minStock: { type: Number, default: 5 }, // Low stock alert threshold
+    minStock: { type: Number, default: 2 }, // Low stock alert threshold
     unit: { type: String, required: true },
     sku: { type: String },
     barcode: { type: String, index: true },
