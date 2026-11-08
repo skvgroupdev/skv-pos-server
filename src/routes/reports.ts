@@ -1268,7 +1268,7 @@ router.get("/inventory-valuation", async (req: Request, res: Response) => {
                     totalItems: { $sum: 1 },
                     lowStockCount: {
                         $sum: {
-                            $cond: [{ $lte: ["$stock", "$minStock"] }, 1, 0]
+                            $cond: [{ $and: [{ $gt: ["$stock", 0] }, { $gt: ["$minStock", 0] }, { $lt: ["$stock", "$minStock"] }] }, 1, 0]
                         }
                     }
                 }
@@ -1441,7 +1441,7 @@ router.get("/product-performance", async (req: Request, res: Response) => {
                     avgPrice: 1,
                     stockStatus: {
                         $cond: [
-                            { $lte: ["$productInfo.stock", "$productInfo.minStock"] },
+                            { $and: [{ $gt: ["$productInfo.stock", 0] }, { $gt: ["$productInfo.minStock", 0] }, { $lt: ["$productInfo.stock", "$productInfo.minStock"] }] },
                             "low",
                             "normal"
                         ]
@@ -1549,7 +1549,7 @@ router.get("/low-stock-products", async (req: Request, res: Response) => {
 
         const lowStockProducts = await Product.find({
             tenantId,
-            $expr: { $lte: ["$stock", "$minStock"] }
+            $expr: { $and: [{ $gt: ["$stock", 0] }, { $gt: ["$minStock", 0] }, { $lt: ["$stock", "$minStock"] }] }
         })
             .select('name category stock minStock costPrice sellPrice supplier brand')
             .sort({ stock: 1 })
@@ -1557,9 +1557,9 @@ router.get("/low-stock-products", async (req: Request, res: Response) => {
 
         const enriched = lowStockProducts.map(p => ({
             ...p,
-            reorderQuantity: Math.max(50, (p.minStock || 5) * 3 - (p.stock || 0)),
+            reorderQuantity: Math.max(50, (p.minStock || 0) * 3 - (p.stock || 0)),
             daysUntilStockout: Math.ceil((p.stock || 0) / Math.max(1, (p.stock || 0) * 0.1)),
-            status: (p.stock || 0) === 0 ? 'out-of-stock' : (p.stock || 0) <= (p.minStock || 5) * 0.5 ? 'critical' : 'low'
+            status: (p.stock || 0) <= (p.minStock || 0) * 0.5 ? 'critical' : 'low'
         }));
 
         res.json({ data: enriched });

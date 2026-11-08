@@ -84,7 +84,8 @@ export class ProductService {
           query.$expr = {
             $and: [
               { $gt: ["$stock", 0] },
-              { $lt: ["$stock", { $cond: [{ $gt: ["$minStock", 0] }, "$minStock", 2] }] },
+              { $gt: ["$minStock", 0] },
+              { $lt: ["$stock", "$minStock"] },
             ],
           };
         } else if (filters.stockLevel === "out") {
@@ -142,7 +143,8 @@ export class ProductService {
                 {
                   $and: [
                     { $gt: ["$stock", 0] },
-                    { $lt: ["$stock", { $cond: [{ $gt: ["$minStock", 0] }, "$minStock", 2] }] },
+                    { $gt: ["$minStock", 0] },
+                    { $lt: ["$stock", "$minStock"] },
                   ],
                 },
                 1,
